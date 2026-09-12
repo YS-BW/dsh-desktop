@@ -743,6 +743,12 @@ async function upgradeTo(version) {
     }
 
     engineStatus = { ...engineStatus, hasUpdate: false, latest: undefined }
+    if (result.pruned?.removed?.length) {
+      log(
+        `已清理 ${result.pruned.removed.length} 个旧引擎（${result.pruned.removed.join('、')}），` +
+          `释放约 ${Math.round(result.pruned.freedBytes / 1048576)} MB`
+      )
+    }
     pushSplash({
       phase: '正在重启引擎',
       detail: '窗口马上回来',
@@ -1358,62 +1364,10 @@ function buildMenu() {
       })
     }
 
-    // 已装版本：可切过去，也可删除（正在用的那个除外）
-    const switchable = installed.filter((e) => !e.active)
-    if (switchable.length > 0) {
-      engineItems.push({ type: 'separator' })
-      engineItems.push({
-        label: '切换到已装版本',
-        submenu: switchable.map((e) => ({
-          label: `${e.version}（${Math.round(e.sizeBytes / 1048576)} MB）`,
-          click: async () => {
-            const confirm = await dialog.showMessageBox({
-              type: 'question',
-              message: `切换到引擎 ${e.version}？`,
-              detail: '需要重启后端才能生效。',
-              buttons: ['取消', '切换'],
-              defaultId: 1,
-              cancelId: 0
-            })
-            if (confirm.response !== 1) return
-            engine.promote(e.version)
-            refreshMenu()
-            await restartBackend()
-          }
-        }))
-      })
-
-      const removable = switchable.filter((e) => e.version !== current)
-      if (removable.length > 0) {
-        engineItems.push({
-          label: '删除旧引擎',
-          submenu: removable.map((e) => ({
-            label: `${e.version}（${Math.round(e.sizeBytes / 1048576)} MB）`,
-            click: async () => {
-              const confirm = await dialog.showMessageBox({
-                type: 'warning',
-                message: `删除引擎 ${e.version}？`,
-                detail: '删掉后如果要再用，需要重新从 npm 下载。',
-                buttons: ['取消', '删除'],
-                defaultId: 1,
-                cancelId: 0
-              })
-              if (confirm.response !== 1) return
-              const removed = engine.removeEngine(e.version)
-              if (!removed.ok) {
-                dialog.showMessageBox({
-                  type: 'error',
-                  message: '删除失败',
-                  detail: String(removed.error),
-                  buttons: ['好']
-                })
-              }
-              refreshMenu()
-            }
-          }))
-        })
-      }
-    }
+    // 这里原本还有「切换到已装版本」和「删除旧引擎」两个子菜单。
+    // 引擎目录现在只保留「当前 + 上一个」（见 updater.js 的 pruneEngines），
+    // 于是「非当前的那个已装版本」永远就是回滚目标本身 —— 两个子菜单都成了
+    // 跟「回滚到 X」重复的入口，索性去掉，菜单只剩一条明确的路径。
 
     // 只有当「当前用的不是自带引擎」时，才提供「改用自带引擎」
     if (current !== bundledEngineVersion()) {
@@ -1620,6 +1574,17 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     loadSettings()
 
+
+    // 收掉历史累积：以前每次升级都只写指针、不删旧目录，所以装了多个版本的
+    // 用户这里会被一次性清理到「当前 + 上一个」。只能保留两个是设计，不是妥协 ——
+    // 能回滚的只有一步，第三代留着纯占磁盘（一个约 280MB）。
+    const startupPrune = updater()?.pruneEngines()
+    if (startupPrune?.removed?.length) {
+      log(
+        `启动清理：删掉 ${startupPrune.removed.length} 个旧引擎（${startupPrune.removed.join('、')}），` +
+          `释放约 ${Math.round(startupPrune.freedBytes / 1048576)} MB`
+      )
+    }
 
     buildMenu()
     createWindow()

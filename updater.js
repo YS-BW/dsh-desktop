@@ -577,7 +577,9 @@ function createUpdater(options) {
     if (before !== undefined && before !== version) writePrevious(before)
     writePointer(currentFile, version)
     writeState({ lastPromotedAt: Date.now(), lastPromotedVersion: version })
-    return { previous: before }
+    // 指针写完之后才清理，保证 keep 集合里那两个一定是当前状态
+    const pruned = pruneEngines()
+    return { previous: before, pruned }
   }
 
   /**
@@ -640,6 +642,37 @@ function createUpdater(options) {
     }
   }
 
+  /**
+   * 只保留「当前在用的」和「上一个」两个引擎目录，其余全删。
+   *
+   * 为什么不保留全部历史：一个引擎版本约 280MB，而**能回滚的只有一步** ——
+   * `rollback()` 只认 `previous` 这一个指针。留着第三代、第四代除了占磁盘没有任何
+   * 用途，所以每次切换完顺手清掉。
+   *
+   * `previous` 如果是 App 自带引擎的版本号（第一次升级之后就是这种情况），
+   * 它在 engines/ 里本来就没有目录，保留集合里带着它也无害 —— 自带那份在 App 包里，
+   * 永远不会被这里删掉。
+   *
+   * 只在指针**已经写完**之后调用，否则可能把马上要用的那个目录删掉。
+   */
+  function pruneEngines() {
+    const keep = new Set([currentVersion(), readPrevious()].filter((v) => v !== undefined))
+    const removed = []
+    let freedBytes = 0
+    for (const engine of listEngines()) {
+      if (keep.has(engine.version)) continue
+      try {
+        fs.rmSync(engine.path, { recursive: true, force: true })
+        removed.push(engine.version)
+        freedBytes += engine.sizeBytes
+      } catch (error) {
+        // 删不掉不算失败：磁盘多占一点，但绝不能因此让升级流程报错。
+        log(`删除旧引擎 ${engine.version} 失败:`, String(error?.message || error))
+      }
+    }
+    return { removed, freedBytes }
+  }
+
   /** 清掉残留的 staging 目录（上次安装中途退出的）。 */
   function cleanStaging() {
     let removed = 0
@@ -662,6 +695,7 @@ function createUpdater(options) {
     currentVersion,
     runningVersion,
     listEngines,
+    pruneEngines,
     readState,
     checkAvailability,
     check,
