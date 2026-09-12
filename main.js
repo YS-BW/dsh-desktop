@@ -14,13 +14,14 @@
  * 一个 hmr-fallback 插件。真 Node 没有这个问题，所以这里零插件。
  */
 
-const { app, BrowserWindow, shell, dialog, Menu, nativeTheme } = require('electron')
+const { app, BrowserWindow, shell, dialog, Menu, nativeTheme, Notification } = require('electron')
 const { spawn, execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createRequire } = require('node:module')
 const { createUpdater } = require('./updater')
+const { createTurnWatcher, formatDuration, summarize } = require('./notify')
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
@@ -273,6 +274,54 @@ function isExecutable(candidate) {
 }
 
 
+// ── 应用设置（菜单里改的那些偏好）─────────────────────────────────────────
+
+/** 设置文件路径。和引擎用的 state.json 分开，避免互相覆盖。 */
+function settingsFilePath() {
+  return path.join(DESKTOP_HOME, 'settings.json')
+}
+
+function loadSettings() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(settingsFilePath(), 'utf8'))
+    const notify = raw?.notify
+    if (notify !== null && typeof notify === 'object') {
+      notifySettings = {
+        ...NOTIFY_DEFAULTS,
+        ...Object.fromEntries(
+          Object.entries(notify).filter(([key]) => key in NOTIFY_DEFAULTS)
+        )
+      }
+    }
+  } catch {
+    // 文件不存在或坏了都用默认值 —— 设置读不出来不该影响启动
+  }
+}
+
+function saveSettings() {
+  try {
+    fs.mkdirSync(DESKTOP_HOME, { recursive: true })
+    let existing = {}
+    try {
+      existing = JSON.parse(fs.readFileSync(settingsFilePath(), 'utf8')) ?? {}
+    } catch {}
+    const next = { ...existing, notify: notifySettings }
+    const temp = `${settingsFilePath()}.tmp`
+    fs.writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    fs.renameSync(temp, settingsFilePath())
+  } catch (error) {
+    log('保存设置失败:', String(error?.message || error))
+  }
+}
+
+/** 改一个通知设置并落盘 + 重建菜单（勾选状态要跟着变）。 */
+function updateNotifySettings(patch) {
+  notifySettings = { ...notifySettings, ...patch }
+  saveSettings()
+  refreshMenu()
+  log(`通知设置：${JSON.stringify(patch)}`)
+}
+
 // ── 引擎升级器 ──────────────────────────────────────────────────────────
 
 /**
@@ -303,6 +352,31 @@ function bundledEngineVersion() {
   const bin = bundledDshEntry()
   return bin ? engineVersion(bin) : undefined
 }
+
+/**
+ * 通知设置。全部通过菜单栏「通知」调整，落盘保存。
+ *
+ * mode 是「什么时候通知」：
+ *   always    始终通知（默认）—— 发完消息盯着窗口等结果时，你最想知道「跑完了」
+ *   unfocused 仅窗口不在前台时 —— 你正看着就不打扰
+ *   long      仅长任务 —— 短问答不打扰，跑得久的才叫
+ */
+const NOTIFY_DEFAULTS = {
+  enabled: process.env.DSH_MIN_NO_NOTIFY !== '1',
+  mode: 'always',
+  longThresholdMs: 30_000,
+  showTitle: true,
+  showDuration: true,
+  showSummary: true,
+  notifyOnInterrupt: true
+}
+
+let notifySettings = { ...NOTIFY_DEFAULTS }
+
+/** 最近一次投递结果，显示在菜单里。 */
+let lastDelivery = { at: undefined, outcome: undefined, label: undefined }
+
+let turnWatcher
 
 /** 界面要显示的引擎状态。 */
 let engineStatus = {
@@ -411,6 +485,7 @@ function startBackend(port) {
         ownsChild = true
         log('后端就绪:', url.replace(/token=.*/, 'token=<hidden>'))
         loadIntoWindow(url)
+        startNotifier()
       }
     }
   }
@@ -679,6 +754,206 @@ async function rollbackEngine() {
     cancelId: 0
   })
   if (next.response === 1) await restartBackend()
+}
+
+// ── 轮次通知 ────────────────────────────────────────────────────────────
+
+/**
+ * 从投影缓存里读会话标题，**只用于通知文案**。
+ *
+ * 注意定位：读取投影缓存是「缓存」，官方明确说它的字段会随 `stateVersion` 变。
+ * 所以这里只把它当**装饰**用 —— 读不到就退回只显示用时，绝不用它做触发判断。
+ * 触发判断走的是会话 JSONL 的 turn/end（那是冻结在 v0 的持久化契约）。
+ */
+function sessionTitle(sessionId) {
+  try {
+    const file = path.join(DSH_HOME, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const value = raw?.record?.rows?.title?.val
+    return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 把窗口带到前台。点通知时用。 */
+function focusWindow() {
+  if (!win || win.isDestroyed()) return
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/**
+ * 投递一条通知，并回报结果。
+ *
+ * 为什么要等事件而不是直接返回：macOS 上通知可能被系统权限拦掉，此时
+ * `show()` 不会抛错、`isSupported()` 也照样返回 true —— 只有 `failed` 事件才告诉你
+ * 真实结果（实测开发态会报 `UNErrorDomain 错误1`）。所以统一走这个封装，
+ * 让「为什么没通知」永远有答案。
+ *
+ * @returns 'shown' | 'failed:…' | 'unsupported' | 'timeout'
+ */
+function notify({ title, body, subtitle, onClick } = {}) {
+  return new Promise((resolve) => {
+    // 整个构造过程包在 try 里：以前这里写错一个变量名会让 Promise 抛异常、
+    // 变成未捕获的 rejection —— 结果就是通知**彻底静默失效**，连日志都没有。
+    // 现在任何异常都降级成「投递失败」这一条可诊断的结果。
+    try {
+      if (!Notification.isSupported()) {
+        resolve('unsupported')
+        return
+      }
+      let settled = false
+      const done = (outcome) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(outcome)
+      }
+      const notification = new Notification({ title, body, subtitle, silent: false })
+
+      // 5 秒内既没 show 也没 failed，就当超时（系统可能静默丢弃）
+      const timer = setTimeout(() => done('timeout'), 5000)
+      notification.on('show', () => done('shown'))
+      notification.on('failed', (_event, error) => done(`failed:${String(error)}`))
+      if (onClick) notification.on('click', onClick)
+
+      notification.show()
+    } catch (error) {
+      resolve(`failed:${String(error?.message || error)}`)
+    }
+  })
+}
+
+/**
+ * 通知权限自检 —— 菜单里的「测试通知」。
+ *
+ * 它会真的发一条通知，并把投递结果（成功 / 被拦 / 原因）用对话框告诉你。
+ * 因为 macOS 的通知权限只能通过「实际投递」来验证：`isSupported()` 在没授权时
+ * 也返回 true，只有 `failed` 事件才说出真相。
+ */
+async function testNotificationPermission() {
+  const supported = Notification.isSupported()
+  log(`通知权限测试：isSupported=${supported}`)
+
+  if (!supported) {
+    dialog.showMessageBox({
+      type: 'warning',
+      message: '这台系统不支持通知',
+      detail: 'Notification.isSupported() 返回 false，通知功能不可用。',
+      buttons: ['好']
+    })
+    return
+  }
+
+  const outcome = await notify({
+    title: 'DSH 通知测试',
+    body: '如果你看到这条，说明通知可用。',
+    subtitle: '点我试试能不能回到窗口',
+    onClick: focusWindow
+  })
+  log(`通知权限测试结果：${outcome}`)
+
+  if (outcome === 'shown') {
+    dialog.showMessageBox({
+      type: 'info',
+      message: '通知可用',
+      detail:
+        '测试通知已投递。\n\n' +
+        '如果屏幕上没看到，检查「系统设置 → 通知 → DSH Desktop Min」是否被设为「无」或开了「专注模式」。',
+      buttons: ['好']
+    })
+    return
+  }
+
+  // 失败：区分开发态和打包态，给出可执行的下一步
+  const inDev = !app.isPackaged
+  dialog.showMessageBox({
+    type: 'warning',
+    message: '通知投递失败',
+    detail:
+      `结果：${outcome}\n\n` +
+      (inDev
+        ? '当前是开发态运行（npm start）。开发态的 Electron 没有 app bundle 授权，' +
+          '系统会拒绝通知并报 UNErrorDomain 错误 1 —— 这是预期行为，' +
+          '用打包后的 .app 测才能验证。'
+        : '请检查：\n' +
+          '1. 系统设置 → 通知 → DSH Desktop Min 是否允许\n' +
+          '2. 是否开了专注模式 / 勿扰\n' +
+          '3. App 是否被移动过位置（移动后需要重新打开一次让系统重新登记）'),
+    buttons: ['好']
+  })
+}
+
+function startNotifier() {
+  if (turnWatcher) return
+  turnWatcher = createTurnWatcher({
+    sessionsDir: path.join(DSH_HOME, 'sessions'),
+    log,
+    onTurnEnd: ({ sessionId, reason, durationMs, summary: summaryText }) => {
+      // 每个决策都留痕 —— 否则「为什么没通知」会变成玄学问题
+      if (!notifySettings.enabled) {
+        log('轮次结束，但通知已关闭，跳过')
+        return
+      }
+
+      const completed = reason === 'completed'
+
+      if (!completed && !notifySettings.notifyOnInterrupt) {
+        log(`轮次以 ${reason} 结束，但设置里关掉了「中断时也通知」，跳过`)
+        return
+      }
+
+      // 通知方式：决定「什么时候通知」
+      const focused = win && !win.isDestroyed() && win.isFocused() && !win.isMinimized()
+      if (notifySettings.mode === 'unfocused' && focused) {
+        log('轮次结束，窗口在前台（设置为「仅窗口不在前台时」），跳过')
+        return
+      }
+      if (
+        notifySettings.mode === 'long' &&
+        (durationMs === undefined || durationMs < notifySettings.longThresholdMs)
+      ) {
+        log(`轮次结束，用时 ${formatDuration(durationMs) ?? '未知'} 未超过阈值，跳过`)
+        return
+      }
+
+      // 通知三段式（对齐微信那种观感）：
+      //   标题 = 会话标题（谁）     副标题 = 状态 + 用时     正文 = 助手回复摘要（说了什么）
+      const title = notifySettings.showTitle ? sessionTitle(sessionId) : undefined
+      const duration = notifySettings.showDuration ? formatDuration(durationMs) : undefined
+      const status = completed ? '任务完成' : '任务中断'
+      const summary = notifySettings.showSummary ? summarize(summaryText) : undefined
+
+      const subtitleParts = [status]
+      if (!notifySettings.showTitle && title === undefined) subtitleParts.unshift('DSH')
+      if (duration !== undefined) subtitleParts.push(`用时 ${duration}`)
+
+      const label = `${status}${title !== undefined ? ` · ${title}` : ''}${
+        duration !== undefined ? ` · 用时 ${duration}` : ''
+      }`
+
+      notify({
+        title: title ?? 'DSH Desktop Min',
+        subtitle: subtitleParts.join(' · '),
+        body: summary ?? (completed ? '本轮处理已完成' : '本轮处理被中断'),
+        // 点通知就回到窗口 —— 这是桌面端相对浏览器通知的独有优势
+        onClick: focusWindow
+      }).then((outcome) => {
+        lastDelivery = { at: Date.now(), outcome, label }
+        refreshMenu() // 菜单里要显示「最近投递」
+        log(
+          outcome === 'shown'
+            ? `通知已投递：${label}${summary !== undefined ? ` · ${summary}` : ''}`
+            : `通知投递失败(${outcome})：${label}`
+        )
+      })
+    }
+  })
+  void turnWatcher.start().then(() => {
+    log('轮次通知已就绪（监听会话事件流）')
+  })
 }
 
 /**
@@ -986,11 +1261,69 @@ function buildMenu() {
     }
   }
 
+  // ── 通知菜单：独立的顶级分块，不挂在「服务」下面 ──────────────────────
+  //
+  // 一二级划分原则：**一级放「动作和状态」，二级放「成组的选项」**。
+  //   一级：启用通知（开关）、测试通知权限（动作）、最近投递（状态）
+  //   二级：通知方式（三选一）、通知内容（多选）—— 成组的偏好才有资格当二级
+  const modeItems = [
+    { id: 'always', label: '始终通知' },
+    { id: 'unfocused', label: '仅窗口不在前台时' },
+    { id: 'long', label: `仅长任务（超过 ${Math.round(notifySettings.longThresholdMs / 1000)} 秒）` }
+  ].map((mode) => ({
+    label: mode.label,
+    type: 'radio',
+    checked: notifySettings.mode === mode.id,
+    click: () => updateNotifySettings({ mode: mode.id })
+  }))
+
+  const contentItems = [
+    { key: 'showTitle', label: '显示会话标题' },
+    { key: 'showSummary', label: '显示回复摘要' },
+    { key: 'showDuration', label: '显示用时' },
+    { key: 'notifyOnInterrupt', label: '任务中断时也通知' }
+  ].map((entry) => ({
+    label: entry.label,
+    type: 'checkbox',
+    checked: notifySettings[entry.key],
+    click: (item) => updateNotifySettings({ [entry.key]: item.checked })
+  }))
+
+  const deliveryLabel = (() => {
+    if (lastDelivery.outcome === undefined) return '最近投递：尚未发送过'
+    const when = new Date(lastDelivery.at).toLocaleTimeString('zh-CN', { hour12: false })
+    if (lastDelivery.outcome === 'shown') return `最近投递：${when} 成功`
+    return `最近投递：${when} 失败（${lastDelivery.outcome}）`
+  })()
+
+  const notifyItems = [
+    {
+      label: '启用通知',
+      type: 'checkbox',
+      checked: notifySettings.enabled,
+      click: (item) => updateNotifySettings({ enabled: item.checked })
+    },
+    { type: 'separator' },
+    { label: '通知方式', submenu: modeItems },
+    { label: '通知内容', submenu: contentItems },
+    { type: 'separator' },
+    {
+      label: '测试通知权限…',
+      click: () => void testNotificationPermission()
+    },
+    { type: 'separator' },
+    { label: deliveryLabel, enabled: false }
+  ]
+
   const template = [
     ...(isMac ? [{ role: 'appMenu' }] : []),
     {
       label: '引擎',
       submenu: engineItems
+    },
+    {
+      label: '通知',
+      submenu: notifyItems
     },
     {
       label: '编辑',
@@ -1067,6 +1400,8 @@ app.on('activate', () => {
 app.on('before-quit', (event) => {
   if (quitting) return
   quitting = true
+  turnWatcher?.stop()
+
   if (!ownsChild || !child || child.exitCode !== null) return
 
   event.preventDefault()
@@ -1087,21 +1422,8 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.whenReady().then(() => {
-    // 通知自检：DSH_MIN_TEST_NOTIFY=1 时弹一条测试通知，把投递结果打到日志。
-    // 用来验证「打包后的 .app 能不能弹 macOS 通知」—— 开发态会因缺少 app bundle 授权而失败。
-    if (process.env.DSH_MIN_TEST_NOTIFY) {
-      const { Notification } = require('electron')
-      log('通知自检：isSupported =', Notification.isSupported())
-      const n = new Notification({
-        title: 'DSH Desktop Min',
-        body: '通知自检：如果你看到这条，说明通知可用。',
-        subtitle: 'dsh-desktop'
-      })
-      n.on('show', () => log('通知自检：show（已投递）'))
-      n.on('failed', (_e, err) => log('通知自检：failed →', String(err)))
-      n.on('click', () => log('通知自检：click'))
-      n.show()
-    }
+    loadSettings()
+
 
     buildMenu()
     createWindow()
