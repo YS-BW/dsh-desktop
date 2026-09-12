@@ -20,6 +20,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createRequire } = require('node:module')
+const { createUpdater } = require('./updater')
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
@@ -81,18 +82,18 @@ function resolveEngine() {
     return { node: undefined, bin: process.env.DSH_MIN_BIN, source: 'DSH_MIN_BIN' }
   }
 
-  // 1. 更新过的引擎（~/.dsh-desktop/runtime，由 update-dsh.sh 从 npm 拉）
-  const runtime = path.join(DESKTOP_HOME, 'runtime')
-  const updatedBin = path.join(runtime, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-  const updatedNode = path.join(
-    runtime, 'node_modules', 'node', 'bin', process.platform === 'win32' ? 'node.exe' : 'node'
-  )
-  if (fs.existsSync(updatedBin)) {
-    // node 与引擎各自独立解析：更新目录里通常只有引擎（node 随 App 自带），
-    // 所以缺 node 时回落到自带的那份，而不是整个放弃更新。
-    const node = fs.existsSync(updatedNode) ? updatedNode : bundledNodePath()
-    if (node) {
-      return { node, bin: updatedBin, source: `已更新引擎 ${engineVersion(updatedBin)}` }
+  // 1. `current` 指针指向的已升级引擎（engines/<版本>/）
+  //
+  // 版本化目录是关键：升级时新版本装到 engines/<新版本>/，正在跑的那份全程不动。
+  // dsh 运行时会用 `await import()` 延迟加载模块（装插件、profile 热重载都会触发），
+  // 如果升级去动它脚下的文件，那些 import 会失败或加载到新旧混合的状态。
+  const engine = updater()
+  const version = engine?.currentVersion()
+  if (version) {
+    const bin = engine.engineBinPath(engine.engineDir(version))
+    const node = bundledNodePath()
+    if (node && fs.existsSync(bin)) {
+      return { node, bin, source: `已升级引擎 ${version}` }
     }
   }
 
@@ -272,6 +273,47 @@ function isExecutable(candidate) {
 }
 
 
+// ── 引擎升级器 ──────────────────────────────────────────────────────────
+
+/**
+ * 升级器实例。懒建：它需要 `bundledNodePath()`（依赖 app.getAppPath()），
+ * 而那要等 app 可用之后才稳妥。
+ *
+ * 升级用**自带的 node + 自带的 npm**跑 —— 复用 App 里已有的运行时，不额外塞一份。
+ * registry / 镜像 / 代理配置由 npm 自己读 `~/.npmrc`，所以检测和安装走同一份配置。
+ */
+let updaterInstance
+function updater() {
+  if (updaterInstance) return updaterInstance
+  const node = bundledNodePath()
+  if (!node) return undefined
+  updaterInstance = createUpdater({
+    desktopHome: DESKTOP_HOME,
+    nodePath: node,
+    npmCliPath: path.join(app.getAppPath(), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    // 让升级器知道「自带引擎是哪个版本」——回滚目标是具体版本号，而不是「自带」这种抽象状态
+    bundledVersion: bundledEngineVersion,
+    log
+  })
+  return updaterInstance
+}
+
+/** App 自带引擎的版本，作为「当前版本」的兜底。 */
+function bundledEngineVersion() {
+  const bin = bundledDshEntry()
+  return bin ? engineVersion(bin) : undefined
+}
+
+/** 界面要显示的引擎状态。 */
+let engineStatus = {
+  busy: false,
+  phase: '',
+  detail: '',
+  latest: undefined,
+  hasUpdate: false,
+  lastError: undefined
+}
+
 // ── 运行状态 ────────────────────────────────────────────────────────────
 
 let child
@@ -396,6 +438,247 @@ function startBackend(port) {
       app.quit()
     }
   })
+}
+
+/**
+ * 优雅停掉后端。
+ *
+ * DSH 自己给了 5 秒排空宽限（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3`），所以这里等 7 秒
+ * 再升级到 SIGKILL —— 卡在 4 秒会把排空砍断、留下半截会话日志。
+ */
+function stopBackend({ forceAfterMs = 7000 } = {}) {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null) {
+      child = undefined
+      resolve()
+      return
+    }
+    const force = setTimeout(() => {
+      if (child && child.exitCode === null) child.kill('SIGKILL')
+    }, forceAfterMs)
+    child.once('exit', () => {
+      clearTimeout(force)
+      child = undefined
+      resolve()
+    })
+    child.kill('SIGTERM')
+  })
+}
+
+/** 用当前引擎重新拉起后端，并让窗口重新加载。 */
+async function restartBackend() {
+  log('重启后端…')
+  await stopBackend()
+  baseUrl = undefined
+  startBackend(0)
+}
+
+// ── 升级流程（菜单驱动）──────────────────────────────────────────────────
+
+/** 菜单重建：引擎状态变化后调用，让「升级到 X」这类动态项跟着变。 */
+function refreshMenu() {
+  try {
+    buildMenu()
+  } catch (error) {
+    // 不吞：菜单构建失败会让人完全看不到升级入口，必须能从日志里发现
+    log('菜单构建失败:', String(error?.message || error))
+    console.error(error)
+  }
+}
+
+function setEngineBusy(busy, phase = '', detail = '') {
+  engineStatus = { ...engineStatus, busy, phase, detail }
+  refreshMenu()
+}
+
+/**
+ * 「检查更新」：查 npm 上的版本，和当前引擎比。
+ * 只查、不改任何东西。
+ */
+async function checkForUpdates({ silent = false } = {}) {
+  const engine = updater()
+  if (!engine) {
+    if (!silent) {
+      dialog.showMessageBox({
+        type: 'warning',
+        message: '升级功能不可用',
+        detail: '找不到自带的 Node 运行时，无法调用 npm。请重新安装 App。',
+        buttons: ['好']
+      })
+    }
+    return
+  }
+
+  setEngineBusy(true, '正在检查更新…')
+  try {
+    const result = await engine.check(bundledEngineVersion())
+    if (!result.ok) {
+      engineStatus = { ...engineStatus, busy: false, lastError: result.error }
+      refreshMenu()
+      if (!silent) {
+        dialog.showMessageBox({
+          type: 'warning',
+          message: '检查更新失败',
+          detail: String(result.error).slice(0, 600),
+          buttons: ['好']
+        })
+      }
+      return result
+    }
+
+    engineStatus = {
+      busy: false,
+      phase: '',
+      detail: '',
+      latest: result.latest,
+      hasUpdate: result.hasUpdate,
+      lastError: undefined
+    }
+    refreshMenu()
+
+    if (!silent) {
+      if (result.hasUpdate) {
+        const choice = await dialog.showMessageBox({
+          type: 'info',
+          message: `发现新版本 ${result.latest}`,
+          detail:
+            `当前引擎   ${result.current}\n` +
+            `可用最新   ${result.latest}\n\n` +
+            `升级约需 1 分钟，期间可以继续使用。\n` +
+            `升级前会先在隔离环境里验证新引擎，验证不通过不会生效。\n` +
+            `完成后需要重启后端，约 2 秒不可用。`,
+          buttons: ['稍后', `升级到 ${result.latest}`],
+          defaultId: 1,
+          cancelId: 0
+        })
+        if (choice.response === 1) await upgradeTo(result.latest)
+      } else {
+        dialog.showMessageBox({
+          type: 'info',
+          message: '已是最新版本',
+          detail:
+            `当前引擎   ${result.current}\n` +
+            (result.tags?.next && result.tags.next !== result.latest
+              ? `next 通道  ${result.tags.next}\n`
+              : '') +
+            (result.tags?.alpha && result.tags.alpha !== result.latest
+              ? `alpha 通道 ${result.tags.alpha}`
+              : ''),
+          buttons: ['好']
+        })
+      }
+    }
+    return result
+  } finally {
+    if (engineStatus.busy) setEngineBusy(false)
+  }
+}
+
+/**
+ * 升级到指定精确版本。
+ *
+ * 流程：装到 staging → 在隔离 home 里跑三道关卡 → 通过才切换指针 → 询问是否重启。
+ * 全程不改 dsh 一个字节，也不动正在运行的那份引擎。
+ */
+async function upgradeTo(version) {
+  const engine = updater()
+  if (!engine) return
+  if (engineStatus.busy) {
+    dialog.showMessageBox({ type: 'info', message: '已有升级在进行中', buttons: ['好'] })
+    return
+  }
+
+  setEngineBusy(true, `正在升级到 ${version}…`, '准备中')
+  try {
+    const result = await engine.install(version, {
+      onProgress: (p) => setEngineBusy(true, `正在升级到 ${version}…`, p.message),
+      onStep: (step) => {
+        const names = { version: '版本自检', dump: '配置组装', boot: '冷启动' }
+        const marks = { running: '…', passed: '✓', failed: '✗' }
+        log(`关卡 ${names[step.gate] ?? step.gate}: ${marks[step.status] ?? step.status} ${
+          step.detail ?? ''
+        }`)
+      }
+    })
+
+    if (!result.ok) {
+      setEngineBusy(false)
+      dialog.showMessageBox({
+        type: 'error',
+        message: '升级失败（未生效，仍在用原来的引擎）',
+        detail: `阶段：${result.phase ?? '未知'}\n\n${String(result.error ?? '').slice(0, 800)}`,
+        buttons: ['好']
+      })
+      return
+    }
+
+    engineStatus = { ...engineStatus, hasUpdate: false, latest: undefined }
+    setEngineBusy(false)
+
+    const choice = await dialog.showMessageBox({
+      type: 'info',
+      message: `已升级到 ${version}`,
+      detail: '需要重启后端才能生效。\n\n现在重启会中断正在执行的任务。',
+      buttons: ['稍后', '立即重启'],
+      defaultId: 1,
+      cancelId: 0
+    })
+    if (choice.response === 1) {
+      await restartBackend()
+    } else {
+      log(`引擎已切换到 ${version}，等你下次重启后端生效`)
+    }
+  } finally {
+    setEngineBusy(false)
+  }
+}
+
+/** 回滚到上一个状态。 */
+async function rollbackEngine() {
+  const engine = updater()
+  if (!engine) return
+  const previous = engine.previousState()
+  if (!previous) {
+    dialog.showMessageBox({ type: 'info', message: '还没有记录到上一个版本', buttons: ['好'] })
+    return
+  }
+
+  const isBundled = previous === bundledEngineVersion()
+  const confirm = await dialog.showMessageBox({
+    type: 'question',
+    message: `回滚到 ${previous}？`,
+    detail:
+      `上一个版本   ${previous}${isBundled ? '（App 自带）' : ''}\n` +
+      '回滚只改引擎指针，不动任何已安装的文件。\n' +
+      '需要重启后端才能生效。',
+    buttons: ['取消', '回滚'],
+    defaultId: 1,
+    cancelId: 0
+  })
+  if (confirm.response !== 1) return
+
+  const result = engine.rollback()
+  if (!result.ok) {
+    dialog.showMessageBox({
+      type: 'error',
+      message: '回滚失败',
+      detail: String(result.error),
+      buttons: ['好']
+    })
+    return
+  }
+  engineStatus = { ...engineStatus, hasUpdate: false }
+  refreshMenu()
+
+  const next = await dialog.showMessageBox({
+    type: 'info',
+    message: `已回滚到 ${result.version}`,
+    detail: '需要重启后端才能生效。',
+    buttons: ['稍后', '立即重启'],
+    defaultId: 1,
+    cancelId: 0
+  })
+  if (next.response === 1) await restartBackend()
 }
 
 /**
@@ -556,8 +839,159 @@ function createWindow() {
 
 function buildMenu() {
   const isMac = process.platform === 'darwin'
+  const engine = updater()
+  const current = engine ? engine.runningVersion(bundledEngineVersion()) : bundledEngineVersion()
+  const previous = engine?.previousState()
+  const installed = engine ? engine.listEngines() : []
+
+  // ── 引擎子菜单：状态只读展示 + 操作 ────────────────────────────────
+  const engineItems = []
+
+  engineItems.push({
+    label: `当前引擎：${current ?? '未知'}`,
+    enabled: false
+  })
+  engineItems.push({
+    label: `自带引擎：${bundledEngineVersion() ?? '未知'}`,
+    enabled: false
+  })
+  if (installed.length > 0) {
+    engineItems.push({
+      label: `已安装：${installed.map((e) => e.version).join('、')}`,
+      enabled: false
+    })
+  }
+
+  engineItems.push({ type: 'separator' })
+
+  if (engineStatus.busy) {
+    engineItems.push({
+      label: `${engineStatus.phase}${engineStatus.detail ? ` — ${engineStatus.detail}` : ''}`,
+      enabled: false
+    })
+  } else {
+    engineItems.push({
+      label: '检查更新…',
+      accelerator: 'CmdOrCtrl+U',
+      click: () => void checkForUpdates()
+    })
+
+    if (engineStatus.hasUpdate && engineStatus.latest) {
+      engineItems.push({
+        label: `升级到 ${engineStatus.latest}`,
+        click: () => void upgradeTo(engineStatus.latest)
+      })
+    }
+
+    if (previous) {
+      // previous 现在始终是一个版本号；如果那就是自带引擎的版本，额外标注一下
+      const isBundled = previous === bundledEngineVersion()
+      engineItems.push({
+        label: `回滚到 ${previous}${isBundled ? '（自带）' : ''}`,
+        click: () => void rollbackEngine()
+      })
+    }
+
+    // 已装版本：可切过去，也可删除（正在用的那个除外）
+    const switchable = installed.filter((e) => !e.active)
+    if (switchable.length > 0) {
+      engineItems.push({ type: 'separator' })
+      engineItems.push({
+        label: '切换到已装版本',
+        submenu: switchable.map((e) => ({
+          label: `${e.version}（${Math.round(e.sizeBytes / 1048576)} MB）`,
+          click: async () => {
+            const confirm = await dialog.showMessageBox({
+              type: 'question',
+              message: `切换到引擎 ${e.version}？`,
+              detail: '需要重启后端才能生效。',
+              buttons: ['取消', '切换'],
+              defaultId: 1,
+              cancelId: 0
+            })
+            if (confirm.response !== 1) return
+            engine.promote(e.version)
+            refreshMenu()
+            await restartBackend()
+          }
+        }))
+      })
+
+      const removable = switchable.filter((e) => e.version !== current)
+      if (removable.length > 0) {
+        engineItems.push({
+          label: '删除旧引擎',
+          submenu: removable.map((e) => ({
+            label: `${e.version}（${Math.round(e.sizeBytes / 1048576)} MB）`,
+            click: async () => {
+              const confirm = await dialog.showMessageBox({
+                type: 'warning',
+                message: `删除引擎 ${e.version}？`,
+                detail: '删掉后如果要再用，需要重新从 npm 下载。',
+                buttons: ['取消', '删除'],
+                defaultId: 1,
+                cancelId: 0
+              })
+              if (confirm.response !== 1) return
+              const removed = engine.removeEngine(e.version)
+              if (!removed.ok) {
+                dialog.showMessageBox({
+                  type: 'error',
+                  message: '删除失败',
+                  detail: String(removed.error),
+                  buttons: ['好']
+                })
+              }
+              refreshMenu()
+            }
+          }))
+        })
+      }
+    }
+
+    // 只有当「当前用的不是自带引擎」时，才提供「改用自带引擎」
+    if (current !== bundledEngineVersion()) {
+      engineItems.push({ type: 'separator' })
+      engineItems.push({
+        label: `改用 App 自带引擎${bundledEngineVersion() ? `（${bundledEngineVersion()}）` : ''}`,
+        click: async () => {
+          const confirm = await dialog.showMessageBox({
+            type: 'question',
+            message: '改用 App 自带的引擎？',
+            detail: '已安装的版本会保留，随时可以切回来。',
+            buttons: ['取消', '改用'],
+            defaultId: 1,
+            cancelId: 0
+          })
+          if (confirm.response !== 1) return
+          engine.useBundled()
+          refreshMenu()
+          await restartBackend()
+        }
+      })
+    }
+
+    if (engineStatus.lastError) {
+      engineItems.push({ type: 'separator' })
+      engineItems.push({
+        label: '上次检查更新失败…',
+        click: () =>
+          dialog.showMessageBox({
+            type: 'warning',
+            message: '上次检查更新失败',
+            detail: String(engineStatus.lastError).slice(0, 800),
+            buttons: ['好']
+          })
+      })
+    }
+  }
+
   const template = [
     ...(isMac ? [{ role: 'appMenu' }] : []),
+    {
+      label: '引擎',
+      submenu: engineItems
+    },
     {
       label: '编辑',
       submenu: [
@@ -583,8 +1017,34 @@ function buildMenu() {
         { role: 'toggleDevTools' }
       ]
     },
+    {
+      label: '服务',
+      submenu: [
+        {
+          label: '重启后端',
+          click: async () => {
+            const confirm = await dialog.showMessageBox({
+              type: 'question',
+              message: '重启后端？',
+              detail: '会中断正在执行的任务。',
+              buttons: ['取消', '重启'],
+              defaultId: 1,
+              cancelId: 0
+            })
+            if (confirm.response === 1) await restartBackend()
+          }
+        },
+        {
+          label: '在浏览器中打开',
+          click: () => {
+            if (baseUrl) void shell.openExternal(baseUrl)
+          }
+        }
+      ]
+    },
     { role: 'windowMenu' }
   ]
+
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
@@ -611,19 +1071,8 @@ app.on('before-quit', (event) => {
 
   event.preventDefault()
   log('关闭后端（SIGTERM）…')
-  // DSH 自己给了 5 秒排空应用的宽限期（PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3），
-  // 宽限设 7 秒再强杀，免得把它排空到一半砍掉、留下半截会话日志。
-  // 注意：这条路径只负责「优雅」；如果壳被强杀、这里根本没机会跑，
-  // 由 watchdog.js 兜底收尸。
-  const force = setTimeout(() => {
-    if (child && child.exitCode === null) child.kill('SIGKILL')
-    app.quit()
-  }, 7000)
-  child.once('exit', () => {
-    clearTimeout(force)
-    app.quit()
-  })
-  child.kill('SIGTERM')
+  // 只负责「优雅」；如果壳被强杀、这里根本没机会跑，由 watchdog.js 兜底收尸。
+  void stopBackend().then(() => app.quit())
 })
 
 if (!app.requestSingleInstanceLock()) {
@@ -651,5 +1100,15 @@ if (!app.requestSingleInstanceLock()) {
     // port 0 = 让系统分配空闲端口，避免和你在终端里跑的 dsh 抢端口。
     // 孤儿后端由 watchdog.js 负责（壳一死就收尸），这里不用管。
     startBackend(0)
+
+    // 启动后静默检查一次更新。有新版才在「引擎」菜单里出现「升级到 X」，
+    // 不弹窗、不打断 —— 检测到就够，决定权留给你。
+    // 延迟一点，避免和后端启动抢资源。
+    if (!process.env.DSH_MIN_NO_UPDATE_CHECK) {
+      const timer = setTimeout(() => {
+        void checkForUpdates({ silent: true })
+      }, 8000)
+      timer.unref?.()
+    }
   })
 }

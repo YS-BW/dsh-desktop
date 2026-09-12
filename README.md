@@ -40,36 +40,90 @@ Electron 壳  ──spawn──>  node <dsh>/lib/bin.js web --no-open --host 127
 > - 右键点 App → **打开** → 再点「打开」
 > - 或执行一次：`xattr -dr com.apple.quarantine "/Applications/DSH Desktop Min.app"`
 
-## 引擎：自带一份 + 从 npm 更新
+## 引擎：自带一份 + 菜单里从 npm 升级
 
 这是本项目的核心设计，为了同时拿到「下载即用」和「升级不用重装」：
 
 | | 位置 | 作用 |
 |---|---|---|
 | **自带引擎** | `App/Contents/Resources/app/node_modules/` | 打进安装包，保证双击就能用，无需预装任何东西 |
-| **更新引擎** | `~/.dsh-desktop/runtime/` | 在 App **外面**，由 `update-dsh.sh` 从 npm 拉 |
+| **升级的引擎** | `~/.dsh-desktop/engines/<版本>/` | 在 App **外面**，从 npm 拉，多个版本可共存 |
 
 启动时按这个顺序取引擎（`main.js` 的 `resolveEngine`）：
 
 ```
-1. ~/.dsh-desktop/runtime          ← 更新过的（优先）
-2. App 自带的一份                   ← 保证开箱即用
-3. DSH_MIN_BIN 环境变量             ← 调试用
+1. ~/.dsh-desktop/current 指向的版本   ← 升级过的（优先）
+2. App 自带的一份                       ← 保证开箱即用
+3. DSH_MIN_BIN 环境变量                 ← 调试用
 4. 系统里的 dsh（PATH / 标准位置 / 登录 shell）  ← 开发态与兜底
 ```
 
-**升级引擎不需要重新打包、也不需要重新下载 App：**
+### 升级入口：菜单栏「引擎」
 
-```bash
-./update-dsh.sh                 # 更新到 npm 上的 latest
-./update-dsh.sh 0.1.5-rc.1      # 装指定版本
-./update-dsh.sh --check         # 只看当前版本和 npm 最新版，不改动
-./update-dsh.sh --list          # 列出可用版本
-./update-dsh.sh --revert        # 删掉更新目录，回落到 App 自带的引擎
+```
+引擎
+  当前引擎：0.1.5-rc.1              （只读）
+  自带引擎：0.1.2-rc.1              （只读）
+  已安装：0.1.5-rc.1
+  ─────────────
+  检查更新…                    ⌘U
+  升级到 0.1.5-rc.2                  ← 检测到新版才出现
+  ─────────────
+  回滚到 0.1.2-rc.1（自带）           ← 有上一个版本才出现
+  切换到已装版本 ▸
+  删除旧引擎 ▸
+  ─────────────
+  改用 App 自带引擎
 ```
 
-`node` 与 `bin.js` 是**各自独立解析**的：更新目录里通常只有引擎（node 随 App 自带），
-所以缺 node 时会回落到自带的那份，而不是整个放弃更新。
+App 启动后 8 秒会**静默检查一次**更新：有新版才在菜单里出现「升级到 X」，**不弹窗、不打断**。
+
+### 升级过程做了什么
+
+```
+① 检测    npm view @deepseek-ai/dsh dist-tags --json
+② 安装    npm install @deepseek-ai/dsh@<精确版本> --prefix <staging>
+          --save-exact --ignore-scripts
+③ 关卡    在隔离 DSH_HOME 里验证新引擎：
+            --version                     包完整、入口能加载
+            --profile web --dump-config   整棵 profile 插件树能组装
+            冷启动一次                     真能起来并打印启动 URL
+④ 提升    staging 改名 → engines/<版本>/，写 current 指针
+⑤ 重启    询问后重启后端（约 2 秒不可用）
+```
+
+**升级期间 dsh 一直可用**（安装约 1 分钟、关卡约 5 秒），只有第 ⑤ 步重启那 2 秒不可用。
+
+**关卡不通过就什么都不改**：删掉 staging，继续用原来的引擎。
+
+### 两条铁律
+
+**一、版本化目录，绝不碰正在运行的那份。**
+
+dsh 运行时会用 `await import()` 延迟加载模块（装插件、profile 热重载都会触发）。如果升级去动它脚下的文件，那些 import 会失败，或者加载到新旧混合的状态。所以新版本装到 `engines/<新版本>/`，正在跑的那份全程只读，切换只改 `current` 这个指针文件。
+
+**二、升级由外壳驱动，不是 dsh 插件。**
+
+dsh 插件活在**要被替换的那个进程**里，让它编排自己的替换等于进程自杀式自我更新。外壳在 dsh 外面，才能干净地停后端、换指针、重启。
+
+### 回滚
+
+「上一个版本」记的是**具体版本号**，不是「自带」这种抽象状态：
+
+- 升级前用的是自带引擎 → `previous` 记的是自带引擎的版本号（如 `0.1.2-rc.1`），
+  菜单显示「回滚到 0.1.2-rc.1（自带）」，回滚即清掉指针
+- 升级前用的是某个已装引擎 → 菜单显示「回滚到 0.1.5-rc.1」，回滚即切指针过去
+
+回滚是**交换语义**（滚回去之后，刚才那个版本变成新的「上一个版本」），所以误操作可以再滚回来。
+
+回滚**只改指针，不动任何已安装的文件**，所以不会丢东西。
+
+### 为什么这些都只依赖公开接口
+
+检测和安装交给 npm（复用 App 自带的 node + npm，不额外塞运行时）。
+验证只用三个官方 CLI 能力：`--version`、`--profile web --dump-config`、`web`。
+
+**一个字节都不改 dsh，不装任何补丁、不依赖任何内部 API。** 所以上游怎么升级都不会破坏这套升级器。
 
 ### 为什么必须带一个「真正的 Node」
 
@@ -126,11 +180,16 @@ HMR 构造失败会直接带崩整个 profile 启动（报错原文：`--expose-
 ## 开发
 
 ```bash
-npm install          # 装 Electron（.npmrc 已配国内镜像）
+npm install          # 装 Electron + 自带运行时（.npmrc 已配国内镜像）
 npm start            # 开发态运行
 npm run pack         # 只打包成 .app（不压缩，快）
 npm run dist:mac     # 出 DMG + ZIP
 ```
+
+> `npm install` 会装三个运行时依赖：`@deepseek-ai/dsh`（引擎）、`node`（Node 二进制）、
+> `npm`（升级引擎时要调它）。`node` 的二进制由它自己的 preinstall 下载，而我们用
+> `--ignore-scripts` 装依赖，所以 `package.json` 里挂了个 `postinstall` 把它补回来 ——
+> 少了这一步，打包出来的 App 会因为缺 node 而启动失败。
 
 诊断工具（改样式之后用它自查，不用靠肉眼猜）：
 
@@ -203,9 +262,9 @@ DSH 自己给了 5 秒排空宽限（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3`），�
 
 | 文件 | 作用 |
 |---|---|
-| `main.js` | 全部壳逻辑：起窗口、解析引擎、拉后端、注入样式、生命周期 |
+| `main.js` | 壳逻辑 + 「引擎」菜单：起窗口、解析引擎、拉后端、注入样式、生命周期 |
+| `updater.js` | 引擎升级器：检测、安装、关卡、提升、回滚 |
 | `watchdog.js` | 独立看门狗进程，壳异常结束时收尸 |
-| `update-dsh.sh` | 从 npm 拉取/回退引擎 |
 | `diagnose.js` | 布局与拖拽区域的诊断工具 |
 | `electron-builder.yml` | 打包配置（含关闭 asar 的原因） |
 | `.npmrc` | Electron 二进制走国内镜像 |
@@ -216,6 +275,9 @@ DSH 自己给了 5 秒排空宽限（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3`），�
 - **只支持 macOS arm64**。其它平台改 `electron-builder.yml` 的 target 理论上可行，但没验证过。
 - **单写者约束**：见上文，不要同时跑两个后端。
 - **不自带第三方插件市场**。要装社区插件用命令行的 `dsh plugin add`。
+- **升级需要联网**，走 npm 的 registry（读你的 `~/.npmrc`，所以配了镜像就自动走镜像）。
+- **每个引擎版本约 200MB**。默认保留「当前 + 上一个」用于回滚；菜单里可以删旧版本。
+- **升级不覆盖自带引擎**。App 里那份永远是打包当天的版本，是最后兜底；`engines/` 删光也能启动。
 
 ## 许可
 
