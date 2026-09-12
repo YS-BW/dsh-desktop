@@ -1,12 +1,13 @@
 {
   "name": "dsh-desktop-min",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Minimal Electron shell that runs the stock DSH web UI in a native macOS window. No patches to dsh.",
   "main": "main.js",
   "scripts": {
     "postinstall": "cd node_modules/node && node installArchSpecificPackage",
     "start": "electron .",
+    "icon": "node tools/make-icon.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac"

@@ -11,5 +11,8 @@ release/
 diagnose-report.json
 dragtest-result.json
 
+# 图标生成过程的中间产物（master.png / iconset）；成品是 build/icon.icns
+build/icon-build/
+
 # macOS
 .DS_Store

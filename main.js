@@ -59,10 +59,11 @@ const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
 /**
  * 解析后端引擎：返回 { node, bin, source } 或 undefined。
  *
- * 引擎策略：**自带一份 + 可从 npm 更新**。
+ * 引擎策略：**自带一份 + 菜单栏从 npm 升级**。
  *
- *   1. 更新目录（优先）—— `~/.dsh-desktop/runtime`，由 `update-dsh.sh` 从 npm 拉。
- *      它在 App 外面，所以升级引擎**不用重新打包、不用重新下载 App**。
+ *   1. 已升级的引擎（优先）—— `~/.dsh-desktop/engines/<版本>/`，由 `updater.js` 从 npm 拉，
+ *      `current` 指针文件记住当前用哪个。它在 App 外面，所以升级引擎**不用重新打包、
+ *      不用重新下载 App**。装在版本化目录里，升级时正在跑的那份全程不动。
  *   2. 自带的一份 —— 打进 App 里，下载 DMG 的人**双击就能用**，无需预装任何东西。
  *   3. DSH_MIN_BIN —— 显式覆盖，调试用。
  *   4. 系统 dsh（PATH / 标准位置 / 登录 shell）—— 开发态与兜底。

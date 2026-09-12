@@ -57,6 +57,6 @@ dmg:
   # 不做公证，保持简单
   sign: false
 
-# 关掉自动更新：这个 App 的更新方式是「从 npm 拉引擎」（见 update-dsh.sh），
+# 关掉自动更新：这个 App 的更新方式是「原生菜单栏从 npm 拉引擎」（见 README 的「引擎」一节），
 # 不是 electron-builder 的发布通道。
 publish: null
