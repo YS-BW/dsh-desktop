@@ -21,10 +21,11 @@ directories:
 # 打包进 App 的内容：壳自己 + 自带引擎（node 运行时、@deepseek-ai/dsh 及其依赖）
 files:
   - main.js
+  - updater.js
   - watchdog.js
   - package.json
 
-# 这些不进包：诊断脚本、更新脚本、图标源文件（App 运行时用不到）
+# 这些不进包：诊断脚本、图标源文件（App 运行时用不到）
 extraMetadata:
   main: main.js
 
