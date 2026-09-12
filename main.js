@@ -366,7 +366,6 @@ const NOTIFY_DEFAULTS = {
   mode: 'always',
   longThresholdMs: 30_000,
   showTitle: true,
-  showDuration: true,
   showSummary: true,
   notifyOnInterrupt: true
 }
@@ -762,8 +761,8 @@ async function rollbackEngine() {
  * 从投影缓存里读会话标题，**只用于通知文案**。
  *
  * 注意定位：读取投影缓存是「缓存」，官方明确说它的字段会随 `stateVersion` 变。
- * 所以这里只把它当**装饰**用 —— 读不到就退回只显示用时，绝不用它做触发判断。
- * 触发判断走的是会话 JSONL 的 turn/end（那是冻结在 v0 的持久化契约）。
+ * 所以这里只把它当**装饰**用 —— 读不到就退回 App 名当标题，
+ * 绝不用它做触发判断。触发判断走的是会话 JSONL 的 turn/end（那是冻结在 v0 的持久化契约）。
  */
 function sessionTitle(sessionId) {
   try {
@@ -794,7 +793,7 @@ function focusWindow() {
  *
  * @returns 'shown' | 'failed:…' | 'unsupported' | 'timeout'
  */
-function notify({ title, body, subtitle, onClick } = {}) {
+function notify({ title, body, onClick } = {}) {
   return new Promise((resolve) => {
     // 整个构造过程包在 try 里：以前这里写错一个变量名会让 Promise 抛异常、
     // 变成未捕获的 rejection —— 结果就是通知**彻底静默失效**，连日志都没有。
@@ -811,7 +810,7 @@ function notify({ title, body, subtitle, onClick } = {}) {
         clearTimeout(timer)
         resolve(outcome)
       }
-      const notification = new Notification({ title, body, subtitle, silent: false })
+      const notification = new Notification({ title, body, silent: false })
 
       // 5 秒内既没 show 也没 failed，就当超时（系统可能静默丢弃）
       const timer = setTimeout(() => done('timeout'), 5000)
@@ -849,8 +848,7 @@ async function testNotificationPermission() {
 
   const outcome = await notify({
     title: 'DSH 通知测试',
-    body: '如果你看到这条，说明通知可用。',
-    subtitle: '点我试试能不能回到窗口',
+    body: '如果你看到这条，说明通知可用。点我回到窗口。',
     onClick: focusWindow
   })
   log(`通知权限测试结果：${outcome}`)
@@ -919,25 +917,34 @@ function startNotifier() {
         return
       }
 
-      // 通知三段式（对齐微信那种观感）：
-      //   标题 = 会话标题（谁）     副标题 = 状态 + 用时     正文 = 助手回复摘要（说了什么）
+      // 通知两段式（对齐微信那种观感）：
+      //   标题 = 会话标题（谁在说）   正文 = 助手回复摘要（说了什么）
+      //
+      // 刻意**不显示「任务完成」和用时**：正常跑完是默认预期，写在通知里是噪音；
+      // 一条只有「谁 + 说了什么」的通知信息密度最高。
+      // 中断则相反 —— 它是异常路径，必须说出来，所以正文直接写「任务中断」，
+      // 并且**不显示那半截摘要**，免得让人误以为这轮正常跑完了。
       const title = notifySettings.showTitle ? sessionTitle(sessionId) : undefined
-      const duration = notifySettings.showDuration ? formatDuration(durationMs) : undefined
-      const status = completed ? '任务完成' : '任务中断'
       const summary = notifySettings.showSummary ? summarize(summaryText) : undefined
 
-      const subtitleParts = [status]
-      if (!notifySettings.showTitle && title === undefined) subtitleParts.unshift('DSH')
-      if (duration !== undefined) subtitleParts.push(`用时 ${duration}`)
+      let body
+      if (!completed) {
+        body = '任务中断'
+      } else if (summary !== undefined) {
+        body = summary
+      } else if (notifySettings.showSummary) {
+        // 这轮没有文字回复（例如只调了工具），描述事实而不是伪造一个状态
+        body = '本轮没有文字回复'
+      } else {
+        body = '' // 关掉了摘要：只留会话标题，像微信的「有一条新消息」
+      }
 
-      const label = `${status}${title !== undefined ? ` · ${title}` : ''}${
-        duration !== undefined ? ` · 用时 ${duration}` : ''
-      }`
+      const titleText = title ?? 'DSH Desktop Min'
+      const label = `${titleText}：${body || '(无正文)'}`
 
       notify({
-        title: title ?? 'DSH Desktop Min',
-        subtitle: subtitleParts.join(' · '),
-        body: summary ?? (completed ? '本轮处理已完成' : '本轮处理被中断'),
+        title: titleText,
+        body,
         // 点通知就回到窗口 —— 这是桌面端相对浏览器通知的独有优势
         onClick: focusWindow
       }).then((outcome) => {
@@ -945,7 +952,7 @@ function startNotifier() {
         refreshMenu() // 菜单里要显示「最近投递」
         log(
           outcome === 'shown'
-            ? `通知已投递：${label}${summary !== undefined ? ` · ${summary}` : ''}`
+            ? `通知已投递：${label}`
             : `通知投递失败(${outcome})：${label}`
         )
       })
@@ -1263,8 +1270,9 @@ function buildMenu() {
 
   // ── 通知菜单：独立的顶级分块，不挂在「服务」下面 ──────────────────────
   //
-  // 一二级划分原则：**一级放「动作和状态」，二级放「成组的选项」**。
-  //   一级：启用通知（开关）、测试通知权限（动作）、最近投递（状态）
+  // 一二级划分原则：**一级放「开关和动作」，二级放「成组的选项」**。
+  //   一级：启用通知 / 任务中断时也通知（两个独立开关）、测试通知权限（动作）、
+  //         最近投递（状态）
   //   二级：通知方式（三选一）、通知内容（多选）—— 成组的偏好才有资格当二级
   const modeItems = [
     { id: 'always', label: '始终通知' },
@@ -1279,9 +1287,7 @@ function buildMenu() {
 
   const contentItems = [
     { key: 'showTitle', label: '显示会话标题' },
-    { key: 'showSummary', label: '显示回复摘要' },
-    { key: 'showDuration', label: '显示用时' },
-    { key: 'notifyOnInterrupt', label: '任务中断时也通知' }
+    { key: 'showSummary', label: '显示回复摘要' }
   ].map((entry) => ({
     label: entry.label,
     type: 'checkbox',
@@ -1302,6 +1308,12 @@ function buildMenu() {
       type: 'checkbox',
       checked: notifySettings.enabled,
       click: (item) => updateNotifySettings({ enabled: item.checked })
+    },
+    {
+      label: '任务中断时也通知',
+      type: 'checkbox',
+      checked: notifySettings.notifyOnInterrupt,
+      click: (item) => updateNotifySettings({ notifyOnInterrupt: item.checked })
     },
     { type: 'separator' },
     { label: '通知方式', submenu: modeItems },
