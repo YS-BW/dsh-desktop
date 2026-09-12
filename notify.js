@@ -279,8 +279,9 @@ function createTurnWatcher(options) {
           // 启动时就存在的文件：只记当前位置，不回溯历史（否则一开机就狂弹旧通知）。
           // 启动之后才出现的文件：从 0 开始读，这样它第一个轮次结束也能通知到。
           files.set(filePath, initial ? baseline(filePath) : { offset: 0, pending: Buffer.alloc(0) })
-          continue
         }
+        // 这里**不能** continue。新文件注册完也要立刻安排一次消费，否则只能等
+        // 下一轮轮询（POLL_MS = 3s）—— 表现就是「新会话的第一轮通知平白迟到几秒」。
         if (!initial) schedule(filePath)
       }
     }

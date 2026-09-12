@@ -291,7 +291,7 @@ $DSH_HOME/sessions/<编码后的 cwd>/<session-id>/session.jsonl.zstd
 - 会话投影缓存（`~/.dsh/storages/session_projcache/`）是**派生缓存**（`stateVersion` 会跳变），
   所以只用它取会话标题，绝不用它当触发信号 —— 缓存抖动不该变成通知抖动。
 
-有两个坑值得记下来：
+有三个坑值得记下来：
 
 1. **zstd 截断不报错**。读到半帧时 `zstdDecompressSync` 会**静默返回不完整内容**而不抛异常，
    于是「读到一半」和「读到一个完整帧」长得一模一样。解法是用 `{info:true}` 拿到
@@ -299,6 +299,9 @@ $DSH_HOME/sessions/<编码后的 cwd>/<session-id>/session.jsonl.zstd
    （实测 13318 个真实帧，13318 个都以 `\n` 结尾。）
 2. **摘要只能取正文**。`assistant/message` 里可能同时有 `text` 和 `reasoning`，
    只取 `text`；纯工具调用的消息不能覆盖已有摘要，否则通知正文会变成一串函数名。
+3. **新文件注册完必须立刻消费**。`sweep()` 发现新会话文件时只登记了「从 0 开始读」
+   就 `continue` 了，消费要等下一轮轮询（3 秒）—— 表现是**新会话的第一轮通知平白
+   迟到几秒**。改成登记完同一次就 `schedule()`，实测新文件 1.5 秒内必定投递。
 
 ### 通知长什么样
 
@@ -398,6 +401,26 @@ npm run icon -- --tile 0              # 不画底板，只交图形给系统（�
 所以「纯白背景」和「交给 Mac 去做」不可兼得：系统的兜底底板是灰的。
 要白色就必须自己画 —— 也就是 `--tile 0` 之外的那条路。顺便说，这个灰色兜底
 也解释了为什么有些老旧 App 的图标在 Dock 里是灰方块。
+
+### 换了图标之后，通知里可能还是旧图标
+
+**这是 macOS 的图标缓存，不是 App 没更新。** 换图标后实测：Dock 立刻显示新图标，
+但**通知横幅里还是旧图标**，而且杀掉 App、重启 Dock、`killall usernoted` 都不管用 ——
+缓存是按 bundle id 存在图标服务里的，跟 App 进程无关。
+
+要清掉它（`~/Library/Caches/com.apple.iconservices.store` 在新系统上已经不存在了，
+真正的位置在 per-user 的 `DARWIN_USER_CACHE_DIR`）：
+
+```bash
+CACHE=$(getconf DARWIN_USER_CACHE_DIR)
+rm -rf "$CACHE"com.apple.iconservices "$CACHE"com.apple.iconservicesagent
+killall iconservicesagent Dock usernoted NotificationCenter
+```
+
+然后重开 App、再发一条通知即可。
+
+**全新安装的用户不会遇到这个问题** —— 没有旧图标可缓存。只有从旧版本升级上来、
+且系统恰好缓存过老图标时才会看到。
 
 ### 底板形状：不是普通圆角矩形
 
