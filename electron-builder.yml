@@ -24,6 +24,9 @@ files:
   - updater.js
   - notify.js
   - watchdog.js
+  # 接管页：下载 / 校验 / 重启引擎期间窗口里显示的就是它。
+  # 漏了它 = 升级时窗口会切到一个不存在的文件 → 白屏。
+  - splash.html
   - package.json
 
 # 这些不进包：诊断脚本、图标源文件（App 运行时用不到）

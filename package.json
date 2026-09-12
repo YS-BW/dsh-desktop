@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-min",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Minimal Electron shell that runs the stock DSH web UI in a native macOS window. No patches to dsh.",
   "main": "main.js",

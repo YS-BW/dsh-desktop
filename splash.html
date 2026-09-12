@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DSH Desktop Min</title>
+<!--
+  接管页（splash）：下载 / 校验 / 重启引擎期间，窗口里显示的就是这一页。
+
+  它不是 dsh 的一部分，也不由 dsh 提供 —— 它和 main.js 一起打进 App，
+  用 file:// 加载。所以引擎正在被换掉、后端根本不存在的这段时间里，
+  它照样能渲染。
+
+  和 dsh 页面的关系：主进程先 loadFile 这一页，等新后端从 stdout 报出 URL，
+  再 loadURL 切回 dsh。整个过程中窗口本身、菜单、通知都没动过。
+
+  数据通道是单向的：主进程用 executeJavaScript 调用 window.__dshSplash.update()。
+  这里刻意不做 preload / IPC —— 那个窗口的 webPreferences 是为**远端** dsh 页面
+  设的（sandbox + contextIsolation + 无 preload），给本地页面开 IPC 就等于给
+  远端页面也开了一个洞。
+-->
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #171513;
+    --muted: #8a8580;
+    --line: #e8e5e1;
+    --track: #eeeae6;
+    --accent: #171513;
+    --err: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #171513;
+      --fg: #f2efec;
+      --muted: #8c8681;
+      --line: #2a2622;
+      --track: #262220;
+      --accent: #f2efec;
+      --err: #ff6b5e;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.6 -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+    /* 隐藏标题栏后红绿灯浮在内容之上，这里自己留出顶部空间（dsh 页面靠注入 CSS 让位，
+       接管页得自己处理），同时整页可拖动窗口。 */
+    -webkit-app-region: drag;
+    -webkit-user-select: none; user-select: none;
+  }
+  .wrap {
+    height: 100%; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 72px 48px 48px; text-align: center;
+  }
+  .mark { width: 76px; height: 76px; margin-bottom: 20px; }
+  .mark svg { width: 100%; height: 100%; display: block; }
+  .mark path { fill: var(--accent); }
+  h1 {
+    font-size: 15px; font-weight: 600; letter-spacing: .02em;
+    margin: 0 0 4px;
+  }
+  .version { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .phase {
+    margin: 28px 0 10px; font-size: 14px; font-weight: 500; min-height: 22px;
+  }
+  .bar {
+    width: 260px; height: 3px; border-radius: 2px;
+    background: var(--track); overflow: hidden; position: relative;
+  }
+  .bar > i {
+    position: absolute; inset: 0 auto 0 0; width: 0%;
+    background: var(--accent); border-radius: 2px;
+    transition: width .25s ease;
+  }
+  /* 进度未知时（下载总大小拿不到、冷启动无进度）走不确定态走马灯 */
+  .bar.indeterminate > i {
+    width: 35% !important;
+    animation: slide 1.15s ease-in-out infinite;
+    transition: none;
+  }
+  @keyframes slide {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(385%); }
+  }
+  .detail {
+    margin: 12px 0 0; color: var(--muted); font-size: 12px;
+    min-height: 19px; max-width: 460px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .steps {
+    list-style: none; margin: 26px 0 0; padding: 0;
+    display: flex; gap: 22px; font-size: 12px; color: var(--muted);
+  }
+  .steps li { display: flex; align-items: center; gap: 6px; }
+  .steps .dot {
+    width: 13px; height: 13px; border-radius: 50%;
+    border: 1.5px solid var(--line); flex: none;
+    display: grid; place-items: center;
+    font-size: 9px; line-height: 1;
+  }
+  .steps li[data-status="running"] { color: var(--fg); }
+  .steps li[data-status="running"] .dot { border-color: var(--fg); }
+  .steps li[data-status="passed"] .dot {
+    border-color: var(--accent); background: var(--accent); color: var(--bg);
+  }
+  .steps li[data-status="failed"] { color: var(--err); }
+  .steps li[data-status="failed"] .dot { border-color: var(--err); color: var(--err); }
+  .error {
+    margin-top: 22px; max-width: 520px; color: var(--err);
+    font-size: 12px; white-space: pre-wrap; text-align: left;
+    display: none;
+  }
+  .error.show { display: block; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="mark">
+      <!-- 官方鲸鱼（dsh-web-frontend/dist/favicon.svg），只改填充色 -->
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50" fill="none">
+        <path d="M48.8354 10.0479C48.3232 9.79199 48.1025 10.2798 47.8032 10.5278C47.7007 10.6079 47.6143 10.7119 47.5273 10.8076C46.7793 11.624 45.9048 12.1597 44.7622 12.0957C43.0923 12 41.666 12.5356 40.4058 13.8398C40.1377 12.2319 39.2476 11.272 37.8926 10.6558C37.1836 10.3359 36.4668 10.0156 35.9702 9.31982C35.6235 8.82373 35.5293 8.27197 35.356 7.72754C35.2456 7.3999 35.1353 7.06396 34.7651 7.00781C34.3633 6.94385 34.2056 7.2876 34.0479 7.57568C33.418 8.75195 33.1733 10.0479 33.1973 11.3599C33.2524 14.312 34.4736 16.6641 36.8999 18.3359C37.1758 18.5278 37.2466 18.7197 37.1597 19C36.9946 19.5757 36.7974 20.1357 36.624 20.7119C36.5137 21.0801 36.3486 21.1597 35.9624 21C34.6309 20.4321 33.481 19.5918 32.4644 18.5757C30.7393 16.8721 29.1792 14.9917 27.2334 13.52C26.7764 13.1758 26.3193 12.856 25.8467 12.5518C23.8618 10.584 26.1069 8.96777 26.627 8.77588C27.1704 8.57568 26.8159 7.8877 25.0591 7.896C23.3022 7.90381 21.6953 8.50391 19.647 9.30371C19.3477 9.42383 19.0322 9.51172 18.7095 9.58398C16.8501 9.22363 14.9199 9.14355 12.9033 9.37598C9.10596 9.80762 6.07275 11.6396 3.84326 14.7681C1.16455 18.5278 0.53418 22.7998 1.30664 27.2559C2.11768 31.9521 4.46582 35.8398 8.07373 38.8799C11.8159 42.0322 16.1255 43.5762 21.041 43.2803C24.0269 43.104 27.3516 42.6963 31.1016 39.4561C32.0469 39.936 33.0396 40.1279 34.686 40.272C35.9546 40.3921 37.1758 40.208 38.1211 40.0078C39.6021 39.688 39.4995 38.2881 38.9639 38.0322C34.623 35.9678 35.5762 36.8081 34.71 36.1279C36.9155 33.4639 40.2402 30.6958 41.54 21.728C41.6426 21.0161 41.5557 20.5679 41.54 19.9917C41.5322 19.6396 41.6108 19.5039 42.0049 19.4639C43.0923 19.3359 44.1479 19.0317 45.1167 18.4878C47.9292 16.9199 49.064 14.3438 49.3315 11.2559C49.3711 10.7837 49.3237 10.2959 48.8354 10.0479ZM24.3262 37.8398C20.1196 34.4639 18.0791 33.3521 17.2358 33.3999C16.4482 33.4482 16.5898 34.3682 16.7632 34.9678C16.9443 35.5601 17.1812 35.9683 17.5117 36.4878C17.7402 36.832 17.8979 37.3442 17.2832 37.728C15.9282 38.584 13.5728 37.4399 13.4624 37.3838C10.7207 35.7358 8.42822 33.5601 6.81348 30.584C5.25342 27.7197 4.34766 24.6479 4.19775 21.3677C4.1582 20.5757 4.38672 20.2959 5.15869 20.1519C6.17529 19.96 7.22314 19.9199 8.23926 20.0718C12.5327 20.7119 16.1885 22.6719 19.2529 25.7759C21.002 27.5439 22.3252 29.6558 23.6885 31.7202C25.1377 33.9121 26.6978 36 28.6831 37.7119C29.3843 38.312 29.9434 38.7681 30.479 39.104C28.8643 39.2881 26.1699 39.3281 24.3262 37.8398ZM26.3433 24.6001C26.3433 24.248 26.6191 23.9678 26.9658 23.9678C27.0444 23.9678 27.1152 23.9839 27.1782 24.0078C27.2651 24.04 27.3438 24.0879 27.4067 24.1602C27.5171 24.272 27.5801 24.4321 27.5801 24.6001C27.5801 24.9521 27.3042 25.2319 26.9575 25.2319C26.6108 25.2319 26.3433 24.9521 26.3433 24.6001ZM32.6064 27.8799C32.2046 28.0479 31.8027 28.1919 31.4165 28.208C30.8179 28.2397 30.1641 27.9922 29.8096 27.688C29.2583 27.2158 28.8643 26.9521 28.6987 26.1279C28.6279 25.7759 28.6675 25.2319 28.7305 24.9199C28.8721 24.248 28.7144 23.8159 28.2495 23.4238C27.8716 23.104 27.3911 23.0161 26.8633 23.0161C26.666 23.0161 26.4849 22.9277 26.3511 22.856C26.1304 22.7441 25.9492 22.4639 26.1226 22.1201C26.1777 22.0078 26.4458 21.7358 26.5088 21.688C27.2256 21.272 28.0527 21.4077 28.8169 21.7197C29.5259 22.0161 30.0615 22.5601 30.834 23.3281C31.6216 24.2559 31.7632 24.5117 32.2124 25.208C32.5669 25.752 32.8901 26.312 33.1104 26.9521C33.2446 27.3521 33.0713 27.6802 32.6064 27.8799Z" fill-rule="nonzero"/>
+      </svg>
+    </div>
+    <h1>DSH Desktop Min</h1>
+    <div class="version" id="version"></div>
+
+    <div class="phase" id="phase">正在启动引擎…</div>
+    <div class="bar" id="bar"><i id="fill"></i></div>
+    <div class="detail" id="detail"></div>
+
+    <ul class="steps" id="steps"></ul>
+    <div class="error" id="error"></div>
+  </div>
+
+<script>
+  const el = {
+    version: document.getElementById('version'),
+    phase: document.getElementById('phase'),
+    bar: document.getElementById('bar'),
+    fill: document.getElementById('fill'),
+    detail: document.getElementById('detail'),
+    steps: document.getElementById('steps'),
+    error: document.getElementById('error')
+  }
+
+  let stepNames = []
+  let stepStatus = []
+
+  function renderSteps() {
+    el.steps.innerHTML = ''
+    stepNames.forEach((name, i) => {
+      const status = stepStatus[i] || 'pending'
+      const li = document.createElement('li')
+      li.dataset.status = status
+      const dot = document.createElement('span')
+      dot.className = 'dot'
+      dot.textContent = status === 'passed' ? '\u2713' : status === 'failed' ? '\u2715' : ''
+      li.appendChild(dot)
+      li.appendChild(document.createTextNode(name))
+      el.steps.appendChild(li)
+    })
+  }
+
+  window.__dshSplash = {
+    update(state) {
+      if (!state) return
+      if (state.version !== undefined) el.version.textContent = state.version
+      if (state.phase !== undefined) el.phase.textContent = state.phase
+      if (state.detail !== undefined) el.detail.textContent = state.detail
+
+      // percent 是 null/undefined 时走不确定态
+      const known = typeof state.percent === 'number' && isFinite(state.percent)
+      el.bar.classList.toggle('indeterminate', !known)
+      if (known) el.fill.style.width = Math.max(0, Math.min(100, state.percent)) + '%'
+
+      if (Array.isArray(state.steps)) {
+        stepNames = state.steps.map((s) => s.name)
+        stepStatus = state.steps.map((s) => s.status)
+        renderSteps()
+      }
+      if (state.error !== undefined) {
+        el.error.textContent = state.error || ''
+        el.error.classList.toggle('show', Boolean(state.error))
+      }
+    }
+  }
+</script>
+</body>
+</html>

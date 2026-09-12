@@ -14,7 +14,7 @@
  * 一个 hmr-fallback 插件。真 Node 没有这个问题，所以这里零插件。
  */
 
-const { app, BrowserWindow, shell, dialog, Menu, nativeTheme, Notification } = require('electron')
+const { app, BrowserWindow, shell, dialog, Menu, nativeTheme, Notification, session } = require('electron')
 const { spawn, execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -396,6 +396,8 @@ let baseUrl
 /** 本次启动是否由我们拉起了后端（决定退出时要不要收尸）。 */
 let ownsChild = false
 let quitting = false
+/** 是否正在为换引擎而主动停后端 —— 期间后端退出是预期行为，不是故障。 */
+let swapping = false
 
 const log = (...args) => console.log('[dsh-min]', ...args)
 
@@ -504,7 +506,10 @@ function startBackend(port) {
   child.on('exit', (code, signal) => {
     log('后端退出:', { code, signal })
     child = undefined
-    if (!quitting) {
+    // swapping：这次退出是我们自己为换引擎而杀的，属于正常流程。
+    // 少了这个判断，restartBackend() 会命中下面这条「报错并退出应用」——
+    // 也就是「立即重启」实际上是坏的：它会弹一个「后端已退出」然后把 App 关掉。
+    if (!quitting && !swapping) {
       // 后端没了，窗口留着也没意义；正常退出路径由 before-quit 处理。
       dialog.showErrorBox(
         '后端已退出',
@@ -541,9 +546,22 @@ function stopBackend({ forceAfterMs = 7000 } = {}) {
 }
 
 /** 用当前引擎重新拉起后端，并让窗口重新加载。 */
-async function restartBackend() {
+/**
+ * 用当前引擎重新拉起后端。
+ *
+ * 窗口先交给接管页 —— 否则用户会盯着一个已经死掉的 dsh 页面看 2 秒。
+ * 新后端起好之后，startBackend 的 onChunk 会把 dsh 页面接回来。
+ */
+async function restartBackend({ phase = '正在重启引擎' } = {}) {
   log('重启后端…')
-  await stopBackend()
+  await showSplash({ phase, detail: '窗口马上回来', percent: null, steps: [] })
+  // swapping 让 child 的 exit 处理器知道这次退出是预期行为。
+  swapping = true
+  try {
+    await stopBackend()
+  } finally {
+    swapping = false
+  }
   baseUrl = undefined
   startBackend(0)
 }
@@ -619,9 +637,9 @@ async function checkForUpdates({ silent = false } = {}) {
           detail:
             `当前引擎   ${result.current}\n` +
             `可用最新   ${result.latest}\n\n` +
-            `升级约需 1 分钟，期间可以继续使用。\n` +
             `升级前会先在隔离环境里验证新引擎，验证不通过不会生效。\n` +
-            `完成后需要重启后端，约 2 秒不可用。`,
+            `点「升级」后窗口会被接管显示进度，期间界面不可用，\n` +
+            `正在执行的任务会被中断。`,
           buttons: ['稍后', `升级到 ${result.latest}`],
           defaultId: 1,
           cancelId: 0
@@ -652,8 +670,15 @@ async function checkForUpdates({ silent = false } = {}) {
 /**
  * 升级到指定精确版本。
  *
- * 流程：装到 staging → 在隔离 home 里跑三道关卡 → 通过才切换指针 → 询问是否重启。
- * 全程不改 dsh 一个字节，也不动正在运行的那份引擎。
+ * 流程：装到 staging → 在隔离 home 里跑三道关卡 → 通过才切换指针 → 换后端。
+ * 全程不改 dsh 一个字节。
+ *
+ * 窗口接管：确认升级后立刻把窗口切成 splash.html，下载和校验的全程都显示真实进度。
+ *
+ * 一条重要的顺序保证 —— **下载和校验期间绝不碰正在跑的旧后端**：
+ * `install()` 的三道关卡跑在隔离 home 里，跟旧后端不冲突。所以只要 install
+ * 没返回 ok，旧引擎就是完好无损的，失败时把 dsh 页面切回去就行，用户连回滚
+ * 都不需要。只有 install 成功之后才动旧后端。
  */
 async function upgradeTo(version) {
   const engine = updater()
@@ -664,20 +689,50 @@ async function upgradeTo(version) {
   }
 
   setEngineBusy(true, `正在升级到 ${version}…`, '准备中')
+
+  // 旧地址留着 —— 失败时用它把 dsh 页面切回来。
+  const previousUrl = baseUrl
+  const gateState = {}
+  const currentVersion = engine.runningVersion(bundledEngineVersion())
+
   try {
+    await showSplash({
+      version: currentVersion ? `${currentVersion} → ${version}` : version,
+      phase: `正在升级到 ${version}`,
+      detail: '准备中',
+      percent: null,
+      steps: gateSteps(),
+      error: ''
+    })
+
     const result = await engine.install(version, {
-      onProgress: (p) => setEngineBusy(true, `正在升级到 ${version}…`, p.message),
+      onProgress: (p) => {
+        setEngineBusy(true, `正在升级到 ${version}…`, p.message)
+        pushSplash({ phase: `正在升级到 ${version}`, detail: p.message, percent: null })
+      },
       onStep: (step) => {
-        const names = { version: '版本自检', dump: '配置组装', boot: '冷启动' }
-        const marks = { running: '…', passed: '✓', failed: '✗' }
-        log(`关卡 ${names[step.gate] ?? step.gate}: ${marks[step.status] ?? step.status} ${
-          step.detail ?? ''
-        }`)
+        log(`关卡 ${GATE_LABELS[step.gate] ?? step.gate}: ${step.status} ${step.detail ?? ''}`)
+        gateState[step.gate] = step.status
+        pushSplash({
+          phase: '正在验证新引擎',
+          detail: `${GATE_LABELS[step.gate] ?? step.gate}${step.detail ? ` · ${step.detail}` : ''}`,
+          percent: null,
+          steps: gateSteps(gateState)
+        })
       }
     })
 
     if (!result.ok) {
       setEngineBusy(false)
+      // 失败也往接管页推一份，这样即使对话框被关掉，页面上也留着错误痕迹。
+      pushSplash({
+        phase: '升级失败',
+        detail: `阶段：${result.phase ?? '未知'}`,
+        percent: null,
+        error: String(result.error ?? '').slice(0, 600)
+      })
+      // 旧引擎全程没动过，直接把 dsh 页面切回去。
+      if (previousUrl) loadIntoWindow(previousUrl)
       dialog.showMessageBox({
         type: 'error',
         message: '升级失败（未生效，仍在用原来的引擎）',
@@ -688,23 +743,27 @@ async function upgradeTo(version) {
     }
 
     engineStatus = { ...engineStatus, hasUpdate: false, latest: undefined }
-    setEngineBusy(false)
-
-    const choice = await dialog.showMessageBox({
-      type: 'info',
-      message: `已升级到 ${version}`,
-      detail: '需要重启后端才能生效。\n\n现在重启会中断正在执行的任务。',
-      buttons: ['稍后', '立即重启'],
-      defaultId: 1,
-      cancelId: 0
+    pushSplash({
+      phase: '正在重启引擎',
+      detail: '窗口马上回来',
+      percent: null,
+      steps: gateSteps(gateState)
     })
-    if (choice.response === 1) {
-      await restartBackend()
-    } else {
-      log(`引擎已切换到 ${version}，等你下次重启后端生效`)
+
+    // 到这里才动旧后端。swapping 让 child 的 exit 处理器知道这是预期退出。
+    swapping = true
+    try {
+      await stopBackend()
+    } finally {
+      swapping = false
     }
-  } finally {
+    baseUrl = undefined
     setEngineBusy(false)
+    log(`引擎已切换到 ${version}，正在拉起新后端`)
+    // 新后端就绪后，startBackend 里的 onChunk 会调 loadIntoWindow 把 dsh 页面接回来。
+    startBackend(0)
+  } finally {
+    if (engineStatus.busy) setEngineBusy(false)
   }
 }
 
@@ -725,7 +784,7 @@ async function rollbackEngine() {
     detail:
       `上一个版本   ${previous}${isBundled ? '（App 自带）' : ''}\n` +
       '回滚只改引擎指针，不动任何已安装的文件。\n' +
-      '需要重启后端才能生效。',
+      '确认后窗口会被接管几秒用于重启引擎，正在执行的任务会被中断。',
     buttons: ['取消', '回滚'],
     defaultId: 1,
     cancelId: 0
@@ -744,16 +803,7 @@ async function rollbackEngine() {
   }
   engineStatus = { ...engineStatus, hasUpdate: false }
   refreshMenu()
-
-  const next = await dialog.showMessageBox({
-    type: 'info',
-    message: `已回滚到 ${result.version}`,
-    detail: '需要重启后端才能生效。',
-    buttons: ['稍后', '立即重启'],
-    defaultId: 1,
-    cancelId: 0
-  })
-  if (next.response === 1) await restartBackend()
+  await restartBackend({ phase: `正在回滚到 ${result.version}` })
 }
 
 // ── 轮次通知 ────────────────────────────────────────────────────────────
@@ -975,11 +1025,110 @@ function attachToExisting(url) {
   loadIntoWindow(url)
 }
 
-function loadIntoWindow(url) {
-  if (win && !win.isDestroyed()) {
-    win.loadURL(url)
-    win.show()
+/**
+ * 清掉历史遗留的浏览器会话 cookie。
+ *
+ * 为什么必须做：后端用 `--port 0` 启动，**每次都是一个新端口**，而 dsh 的浏览器
+ * 会话 cookie 名字是 `dsh-auth-<sha256(host:port)>` —— 端口进了哈希，所以每换一次
+ * 端口就是**一条全新的、永不过期的 cookie**，旧的没有任何人会去删。
+ *
+ * 它们全挂在 `127.0.0.1` 这一个域下，于是每次请求都会把它们**全部**带回服务端。
+ * 实测攒到 64 条（约 3.4KB）时，加上 `/plugins/??…` 那条超长的客户端模块合并 URL，
+ * 整个请求头块超过 Node 默认的 16KB 上限，服务端直接返回 **431 Request Header
+ * Fields Too Large**。表现是页面能打开、但插件全加载不出来：
+ *
+ *     Failed to load plugins
+ *     failed to import loader entry …: client-modules: bundle script /plugins/??… failed to load
+ *
+ * 这个故障是**渐进**的：跑几十次之后才开始，极容易被误判成「dsh 升级把界面弄坏了」。
+ *
+ * 做法上直接清空整个前缀：启动时我们本来就是拿一枚**全新的、进程级的** token 去换
+ * cookie，从来不依赖旧 cookie 存活，所以全删是安全且最省事的。删完这次导航会立刻
+ * 重新种下当前端口那一条。
+ */
+async function pruneAuthCookies() {
+  try {
+    const ses = session.defaultSession
+    const all = await ses.cookies.get({})
+    const stale = all.filter((c) => c.name.startsWith(AUTH_COOKIE_PREFIX))
+    if (stale.length === 0) return
+    for (const cookie of stale) {
+      // 域是 host-only（127.0.0.1），端口不参与 cookie 匹配，所以这个 URL 够用。
+      await ses.cookies.remove(`http://${cookie.domain.replace(/^\./, '')}${cookie.path}`, cookie.name)
+    }
+    log(`清理了 ${stale.length} 条历史会话 cookie（每个后端端口一条，会一直累积）`)
+  } catch (error) {
+    // 清不掉不该拦住启动 —— 最坏就是继续累积，行为退回到修复之前。
+    log('清理历史 cookie 失败:', String(error?.message || error))
   }
+}
+
+async function loadIntoWindow(url) {
+  if (!win || win.isDestroyed()) return
+  // 先清再说：必须在导航**之前**完成，否则可能把即将种下的新 cookie 一起删掉。
+  await pruneAuthCookies()
+  if (!win || win.isDestroyed()) return
+  win.loadURL(url)
+  win.show()
+}
+
+// ── 接管页（splash）──────────────────────────────────────────────────────
+//
+// 下载 / 校验 / 重启引擎期间，窗口里换成 App 自带的 splash.html。
+//
+// 为什么不做覆盖层动画：窗口本来就是一个 loadURL，直接把内容**换掉**比
+// 「抓当前画面当位图盖上去、再交叉淡化」简单得多，也不需要去碰
+// BaseWindow / WebContentsView。而且接管页是真实页面，能显示真实进度、
+// 显示错误、以后还能放按钮，不受「一帧一帧画」的限制。
+//
+// 数据通道刻意做成单向：主进程 executeJavaScript 调 window.__dshSplash.update()。
+// 不引入 preload —— 那个窗口的 webPreferences 是为**远端** dsh 页面设的
+// （sandbox + contextIsolation + 无 preload），给本地页面开 IPC 就等于给远端页面
+// 也开了一个洞。
+
+const SPLASH_FILE = path.join(__dirname, 'splash.html')
+
+/** dsh 浏览器会话 cookie 的前缀；后面拼的是 sha256(host:port) 的 base64url。 */
+const AUTH_COOKIE_PREFIX = 'dsh-auth-'
+
+/** 三道验证关卡的中文名，splash 和日志共用。 */
+const GATE_LABELS = { version: '版本自检', dump: '配置组装', boot: '冷启动' }
+
+/**
+ * 把窗口切到接管页。
+ *
+ * 调用点必须保证：**能走到这里就一定能走回来** —— 失败路径要把 dsh 页面切回去，
+ * 否则用户会永远停在接管页上。
+ */
+async function showSplash(state = {}) {
+  if (!win || win.isDestroyed()) return
+  try {
+    await win.loadFile(SPLASH_FILE)
+    await pushSplash(state)
+  } catch (error) {
+    log('接管页加载失败:', String(error?.message || error))
+  }
+}
+
+/** 往接管页推状态。页面没加载好时记一条日志；失败绝不冒泡影响升级流程。 */
+function pushSplash(state) {
+  if (!win || win.isDestroyed()) return
+  try {
+    const payload = JSON.stringify(state).replace(/</g, '\\u003c')
+    win.webContents
+      .executeJavaScript(`window.__dshSplash && window.__dshSplash.update(${payload})`, true)
+      .catch((error) => log('接管页更新失败:', String(error?.message || error)))
+  } catch (error) {
+    log('接管页更新异常:', String(error?.message || error))
+  }
+}
+
+/** 接管页上的关卡状态，按顺序攒着，每次推全量。 */
+function gateSteps(status = {}) {
+  return Object.entries(GATE_LABELS).map(([id, name]) => ({
+    name,
+    status: status[id] ?? 'pending'
+  }))
 }
 
 // ── 窗口 ────────────────────────────────────────────────────────────────
@@ -1131,6 +1280,19 @@ function createWindow() {
       log(`  [nav] render-process-gone ${details?.reason}`)
     )
     win.webContents.on('dom-ready', () => log('  [nav] dom-ready'))
+  }
+
+  // 临时诊断：打印循环回环地址上的失败请求，用来定位客户端模块包加载不出来。
+  if (process.env.DSH_MIN_TRACE_NET === '1') {
+    const ses = win.webContents.session
+    ses.webRequest.onCompleted({ urls: ['*://127.0.0.1:*/*'] }, (details) => {
+      if (details.statusCode >= 400 || details.url.includes('/plugins/')) {
+        log(`  [net] ${details.statusCode} ${details.url.slice(0, 90)}…`)
+      }
+    })
+    ses.webRequest.onErrorOccurred({ urls: ['*://127.0.0.1:*/*'] }, (details) => {
+      log(`  [net] ERROR ${details.error} ${details.url.slice(0, 90)}…`)
+    })
   }
 
   win.on('closed', () => {
@@ -1455,23 +1617,38 @@ if (!app.requestSingleInstanceLock()) {
     }
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     loadSettings()
 
 
     buildMenu()
     createWindow()
 
-    // DSH_MIN_ATTACH：接入一个已经在跑的实例（跳过自己拉起后端）。
-    // 那个实例的 token 只存在于它自己的启动输出里，所以必须由你显式提供。
+    // 冷启动也走接管页。
+    //
+    // 原来 createWindow() 之后窗口会先 show 一块空白，一直等到 startBackend 从
+    // stdout 解析出 URL 才 loadURL —— 中间那 ~2 秒是白屏。同一个 splash.html
+    // 顺手把这段也接管了：先显示「正在启动引擎」，就绪后 loadIntoWindow 自然切走。
+    //
+    // DSH_MIN_ATTACH 不走这条：它接的是别人已经在跑的实例，没有引擎可等。
     if (process.env.DSH_MIN_ATTACH) {
+      // 接入一个已经在跑的实例（跳过自己拉起后端）。
+      // 那个实例的 token 只存在于它自己的启动输出里，所以必须由你显式提供。
       attachToExisting(process.env.DSH_MIN_ATTACH)
-      return
-    }
+    } else {
+      const engine = resolveEngine()
+      await showSplash({
+        version: engine ? engine.source : '',
+        phase: '正在启动引擎',
+        detail: '',
+        percent: null,
+        steps: []
+      })
 
-    // port 0 = 让系统分配空闲端口，避免和你在终端里跑的 dsh 抢端口。
-    // 孤儿后端由 watchdog.js 负责（壳一死就收尸），这里不用管。
-    startBackend(0)
+      // port 0 = 让系统分配空闲端口，避免和你在终端里跑的 dsh 抢端口。
+      // 孤儿后端由 watchdog.js 负责（壳一死就收尸），这里不用管。
+      startBackend(0)
+    }
 
     // 启动后静默检查一次更新。有新版才在「引擎」菜单里出现「升级到 X」，
     // 不弹窗、不打断 —— 检测到就够，决定权留给你。
@@ -1480,6 +1657,17 @@ if (!app.requestSingleInstanceLock()) {
       const timer = setTimeout(() => {
         void checkForUpdates({ silent: true })
       }, 8000)
+      timer.unref?.()
+    }
+
+    // 测试钩子：启动后直接跑一次升级流程，用来验证接管页和失败回滚。
+    // 菜单里只能点到「最新版」，这个口子可以指定任意版本（包括不存在的版本，
+    // 用来走失败路径）。同样用 DSH_MIN_ 前缀，和别的调试开关一致。
+    if (process.env.DSH_MIN_TEST_UPGRADE) {
+      const target = process.env.DSH_MIN_TEST_UPGRADE
+      const delay = Number(process.env.DSH_MIN_TEST_UPGRADE_DELAY ?? 6000)
+      log(`[测试] ${delay}ms 后触发升级流程 → ${target}`)
+      const timer = setTimeout(() => void upgradeTo(target), delay)
       timer.unref?.()
     }
   })
