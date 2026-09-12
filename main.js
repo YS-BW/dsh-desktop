@@ -1112,6 +1112,27 @@ function createWindow() {
     installDragRegion(win)
   })
 
+  // 渲染进程的加载/导航事件全部留痕。
+  //
+  // 这不是调试残留：判断「换引擎时页面到底是原地重连还是偷偷重载了」只能靠它。
+  // 原地重连是设计的默认路径（前端自带指数退避重连），重载则会丢掉会话内状态，
+  // 两者的日志长得完全不一样 —— 前者一行没有，后者必然出现 did-start-loading。
+  const traceNavigations = process.env.DSH_MIN_TRACE_NAV === '1'
+  if (traceNavigations) {
+    win.webContents.on('did-start-loading', () => log('  [nav] did-start-loading'))
+    win.webContents.on('did-finish-load', () => log('  [nav] did-finish-load'))
+    win.webContents.on('did-fail-load', (_e, code, desc, url) =>
+      log(`  [nav] did-fail-load ${code} ${desc} ${url}`)
+    )
+    win.webContents.on('did-start-navigation', (_e, url, isInPlace, isMainFrame) =>
+      log(`  [nav] did-start-navigation inPlace=${isInPlace} main=${isMainFrame}`)
+    )
+    win.webContents.on('render-process-gone', (_e, details) =>
+      log(`  [nav] render-process-gone ${details?.reason}`)
+    )
+    win.webContents.on('dom-ready', () => log('  [nav] dom-ready'))
+  }
+
   win.on('closed', () => {
     win = undefined
   })
