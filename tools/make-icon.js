@@ -2,33 +2,41 @@
 'use strict'
 
 /**
- * 生成 App 图标：**纯黑圆角方块 + 白色官方鲸鱼**。
+ * 生成 App 图标：**纯白背景 + 纯黑官方鲸鱼**。
  *
- *   node tools/make-icon.js [--fill 0.60]
+ *   node tools/make-icon.js                       # 出 build/icon.icns
+ *   node tools/make-icon.js --fill 0.9            # 鲸鱼占方块宽度的比例
+ *   node tools/make-icon.js --preview /tmp/a.png  # 只出一张 1024 PNG，用来比对
  *
- * 图标里的鲸鱼不是自己描的，而是**直接从 dsh 官方包里取**：
+ * 图标里的鲸鱼不是自己描的，是**直接从 dsh 官方包里取**：
  *
  *   node_modules/@deepseek-ai/dsh-web-frontend/dist/favicon.svg
  *
- * 那是官方 Web UI 的 favicon，也是 manifest.webmanifest 里唯一的图标条目，
- * 即官方承认的品牌图形。本脚本只做两件事：把它的 path 拿出来、换成白色，
- * 放到一个黑色圆角方块上 —— 图形本身一笔不改。
+ * 那是官方 Web UI 的 favicon，也是它 manifest.webmanifest 里唯一的图标条目 ——
+ * 即官方承认的品牌图形。本脚本只做两件事：把它的 path 拿出来、换成黑色，
+ * 放到一个白色圆角方块上。**图形本身一笔不改。**
  *
- * 为什么要借 Chromium 渲染
- * ────────────────────────
- * 那个 path 有 4 个子路径且互相嵌套（鲸鱼身体 / 鳍 / 两只眼睛），靠
- * `fill-rule="nonzero"` 的环绕方向挖空。用 PIL 的 polygon 或任何按「简单多边形」
- * 处理的库都画不出那些挖空。Chromium 是唯一现成的、能正确处理它的渲染器，
- * 而 Electron 里就自带一个。所以这个脚本自己用 electron 重新拉起自己。
+ * ⚠️ 背景方块是本脚本自己生成的。
+ * 官方包里**只有鲸鱼那一条 path，没有任何背景/底板资源**（那个 SVG 里就一个
+ * <path>，连 <rect> 都没有）。所以白色圆角底板是按 macOS 官方图标的实测几何
+ * 合成的，不是官方素材 —— 详见下面「形状」一节。
  *
- * 另外官方 SVG 带一段 `@media (prefers-color-scheme: dark) { path { fill:#fff } }`，
- * 系统是深色模式时 Direct 渲染会得到白鲸鱼 —— 所以这里**只用它的 path 数据**，
- * 颜色由我们显式指定，不受媒体查询影响。
+ * 形状：为什么不是普通圆角矩形
+ * ────────────────────────────
+ * 实测系统图标（Finder / Preview / Notes / Calculator 的 .icns，取 alpha≥128
+ * 即 50% 覆盖率的真实几何边界）：
  *
- * 产物：
- *   build/icon.icns     打包时 electron-builder 用的图标
- *   build/icon.png      1024x1024 主图，留档 / 需要时改尺寸
- *   build/icon.svg      最终 SVG（同样留档，改配色时看它最直观）
+ *   主体    824x824，位于 1024 画布的正中 (100,100) —— 占画布 80.5%
+ *   角      **不是圆弧**：角沿边延伸 209px（顶边平坦段只剩 406px），
+ *           而半径 184.3 的普通圆角矩形平坦段是 455px
+ *
+ * 也就是说用 border-radius 画出来的角比系统图标「方」一圈。这里改用超椭圆
+ * 拟合实测轮廓，角盒 E = 0.2536 × 边长、指数 n = 2.31：
+ *
+ *   x(y) = E * (1 - (1 - ((E-y)/E)^n)^(1/n))
+ *
+ * 该式与实测角轮廓逐点吻合（dy=20 算得 103.6 实测 102；dy=80 算得 31.6 实测 32；
+ * dy=120 算得 13.3 实测 13）。
  */
 
 const { execFileSync } = require('node:child_process')
@@ -40,11 +48,16 @@ const BUILD = path.join(ROOT, 'build')
 const WORK = path.join(BUILD, 'icon-build')
 
 const CANVAS = 1024
-const TILE = 824 // macOS 图标的内容区：1024 画布里四周各留 100pt
-const RADIUS_RATIO = 0.2237 // 接近 Apple 连续圆角的圆角比例
-const CAPTURE = 2048 // 渲染分辨率（2 倍超采样，再缩到各档）
+/** 方块边长占画布比例 —— 实测系统图标 824/1024。 */
+const TILE_RATIO = 824 / 1024
+/** 角盒占方块边长比例 —— 实测系统图标 209/824。 */
+const CORNER_RATIO = 209 / 824
+/** 超椭圆指数 —— 拟合实测角轮廓得到。 */
+const CORNER_EXPONENT = 2.31
+const CAPTURE = 2048 // 渲染分辨率，再缩到各档
 
-/** 各档尺寸 —— iconutil 要求的完整清单。 */
+const DEFAULTS = { bg: '#ffffff', fg: '#000000', fill: 0.9, tile: TILE_RATIO }
+
 const ICONSET = [
   ['icon_16x16.png', 16],
   ['icon_16x16@2x.png', 32],
@@ -60,7 +73,6 @@ const ICONSET = [
 
 // ── 官方图形 ────────────────────────────────────────────────────────────
 
-/** 在 node_modules 里找官方 favicon。找不到就报错说清楚该装什么。 */
 function officialLogoSvg() {
   const candidates = [
     path.join(ROOT, 'node_modules/@deepseek-ai/dsh-web-frontend/dist/favicon.svg'),
@@ -75,7 +87,7 @@ function officialLogoSvg() {
   )
 }
 
-/** 取 <path> 的 d 属性。注意不能直接找 `d="` —— `id="path"` 里也含这个子串。 */
+/** 取 <path> 的 d。注意不能直接找 `d="` —— `id="path"` 里也含这个子串。 */
 function extractPathData(svg) {
   const tag = svg.match(/<path[^>]*>/)
   if (!tag) throw new Error('官方 SVG 里没有 <path>，格式可能变了')
@@ -84,10 +96,7 @@ function extractPathData(svg) {
   return d[1]
 }
 
-/**
- * 把 path 里的三次贝塞尔展平，求墨迹包围盒 —— 这样才知道该把鲸鱼放大多少倍、
- * 往哪儿居中。硬编码包围盒在官方换图形时会静默画歪，所以这里现算。
- */
+/** 展平三次贝塞尔求墨迹包围盒 —— 官方换图形时缩放/居中才不会静默画歪。 */
 function glyphBounds(d, steps = 48) {
   const tokens = d.match(/[MCZ]|-?\d*\.?\d+(?:e-?\d+)?/gi) ?? []
   const points = []
@@ -118,63 +127,123 @@ function glyphBounds(d, steps = 48) {
       cursor = p3
       i += 7
     } else {
-      i += 1 // Z 等闭合指令不影响包围盒
+      i += 1
     }
   }
 
   if (points.length === 0) throw new Error('path 里没解析出任何点')
   const xs = points.map((p) => p[0])
   const ys = points.map((p) => p[1])
-  return {
-    x0: Math.min(...xs),
-    y0: Math.min(...ys),
-    x1: Math.max(...xs),
-    y1: Math.max(...ys)
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) }
+}
+
+// ── 底板形状：超椭圆连续角（对齐系统图标实测轮廓） ──────────────────────
+
+/**
+ * 生成方块轮廓 path。四个角用超椭圆曲线，四条边是直线。
+ *
+ * 四个角都是同一条曲线的镜像，**但遍历方向必须一致**，否则会得到自交路径：
+ * 系统按 nonzero 填充时，方向反了的那个角会往外鼓出一个三角形。
+ *
+ *   左上 tl(t): (E,0) → (0,E)        基准曲线
+ *   右上 tr(t) = 水平镜像 tl(t)       (side-E,0) → (side,E)
+ *   右下 br(t) = 水平+垂直镜像 tl(t)  (side,side-E) → (side-E,side)
+ *   左下 bl(t) = 垂直镜像 tl(t)       (E,side) → (0,side-E)
+ *
+ * 顺时针走：M 落在 tl 的**终点侧**，所以最后一段要把 tl 反着走回去闭合。
+ *
+ * @param pad 方块左上角在画布中的坐标
+ * @param side 方块边长
+ */
+function tilePath(pad, side, segments = 40) {
+  const E = side * CORNER_RATIO
+  const n = CORNER_EXPONENT
+
+  /** 基准曲线：y 从 0 到 E，x 由超椭圆给出。t=0 → (E,0)，t=1 → (0,E) */
+  const tl = (t) => {
+    const y = E * t
+    const v = (E - y) / E
+    return [E * (1 - Math.pow(1 - Math.pow(v, n), 1 / n)), y]
   }
+  const mirrorH = ([x, y]) => [side - x, y]
+  const mirrorV = ([x, y]) => [x, side - y]
+  const mirrorHV = ([x, y]) => [side - x, side - y]
+
+  const pts = []
+  const at = ([x, y]) => [pad + x, pad + y]
+  const push = (p) => pts.push(at(p))
+  const tAt = (k) => k / segments
+
+  const corner = (fn, reverse = false) => {
+    for (let k = 0; k <= segments; k++) {
+      const t = tAt(reverse ? segments - k : k)
+      push(fn(tl(t)))
+    }
+  }
+
+  push(tl(0)) // M = (E,0)，顶边的左端
+  push(mirrorH(tl(0))) // 顶边 → (side-E, 0)
+  corner((p) => mirrorH(p)) // 右上角 → (side, E)
+  push([side, side - E]) // 右边
+  corner((p) => mirrorHV(p), true) // 右下角 → (side-E, side)
+  push([E, side]) // 底边
+  corner((p) => mirrorV(p)) // 左下角 → (0, side-E)
+  push([0, E]) // 左边
+  corner((p) => p, true) // 左上角，反向走回 (E,0) 闭合
+
+  const round = (v) => v.toFixed(3)
+  return `M${pts.map(([x, y]) => `${round(x)} ${round(y)}`).join('L')}Z`
 }
 
 /**
  * 拼出最终图标 SVG。
  * @param d      官方 path 数据
  * @param bounds 官方 path 的墨迹包围盒（官方坐标系，视口 50x50）
- * @param fill   鲸鱼宽度占黑色方块边长的比例
  */
-function buildIconSvg(d, bounds, fill) {
+function buildIconSvg(d, bounds, { fill, bg, fg, tile }) {
+  const side = CANVAS * tile
+  const pad = (CANVAS - side) / 2
+
   const gw = bounds.x1 - bounds.x0
   const gh = bounds.y1 - bounds.y0
   const cx = (bounds.x0 + bounds.x1) / 2
   const cy = (bounds.y0 + bounds.y1) / 2
-  const radius = TILE * RADIUS_RATIO
-  const scale = (TILE * fill) / gw
+
+  const scale = ((tile > 0 ? side : CANVAS) * fill) / gw
   const tx = CANVAS / 2 - cx * scale
   const ty = CANVAS / 2 - cy * scale
 
+  // tile = 0：不画底板，只把图形交给系统 —— 用来看 macOS 会怎么处理「裸图标」
+  const plate =
+    tile > 0
+      ? `  <!-- 底板：自绘的超椭圆连续角方块（官方包没有底板资源） -->\n  <path d="${tilePath(pad, side)}" fill="${bg}"/>\n`
+      : '  <!-- 无底板：图形之外全部透明，看系统怎么兜底 -->\n'
+
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${CANVAS}" height="${CANVAS}" viewBox="0 0 ${CANVAS} ${CANVAS}">
-  <!-- 纯黑圆角方块 -->
-  <rect x="100" y="100" width="${TILE}" height="${TILE}" rx="${radius.toFixed(4)}" ry="${radius.toFixed(4)}" fill="#000000"/>
-  <!-- 官方鲸鱼，只换颜色，图形不动 -->
+${plate}  <!-- 官方鲸鱼，只换颜色，图形不动 -->
   <g transform="translate(${tx.toFixed(6)} ${ty.toFixed(6)}) scale(${scale.toFixed(8)})">
-    <path d="${d}" fill="#ffffff" fill-rule="nonzero"/>
+    <path d="${d}" fill="${fg}" fill-rule="nonzero"/>
   </g>
 </svg>
 `
   return {
     svg,
     stats: {
+      底板: tile > 0 ? `${side.toFixed(1)}x${side.toFixed(1)} @ (${pad.toFixed(1)},${pad.toFixed(1)})  占画布 ${((side / CANVAS) * 100).toFixed(1)}%` : '无（只交图形给系统）',
+      角: `角盒 ${(side * CORNER_RATIO).toFixed(1)}px  指数 ${CORNER_EXPONENT}（超椭圆连续角）`,
       鲸鱼原始宽高: `${gw.toFixed(3)} x ${gh.toFixed(3)}`,
-      缩放倍数: scale.toFixed(4),
-      渲染宽高: `${(gw * scale).toFixed(1)} x ${(gh * scale).toFixed(1)}`,
-      占方块比例: `${(fill * 100).toFixed(0)}% 宽 / ${(((gh * scale) / TILE) * 100).toFixed(0)}% 高`
+      鲸鱼渲染宽高: `${(gw * scale).toFixed(1)} x ${(gh * scale).toFixed(1)}`,
+      鲸鱼占底板: tile > 0 ? `${(fill * 100).toFixed(0)}% 宽 / ${(((gh * scale) / side) * 100).toFixed(0)}% 高` : '—',
+      鲸鱼占画布: `${(((gw * scale) / CANVAS) * 100).toFixed(1)}% 宽`
     }
   }
 }
 
-// ── 渲染（需要 Electron 里的 Chromium） ─────────────────────────────────
+// ── 渲染（借 Electron 里的 Chromium） ───────────────────────────────────
 
-/** 在 Electron 里：渲染 SVG，按各档尺寸导出 PNG，最后打 icns。 */
-async function renderUnderElectron(svgPath, fill) {
-  const { app, BrowserWindow, nativeImage } = require('electron')
-  app.disableHardwareAcceleration() // 离屏渲染，关掉 GPU 更稳
+async function renderUnderElectron(svgPath, options) {
+  const { app, BrowserWindow } = require('electron')
+  app.disableHardwareAcceleration()
 
   await app.whenReady()
 
@@ -184,7 +253,7 @@ async function renderUnderElectron(svgPath, fill) {
     show: false,
     frame: false,
     useContentSize: true,
-    transparent: true, // 方块之外必须透明，系统不会替我们裁形状
+    transparent: true, // 方块之外必须透明，系统不会替 App 裁形状
     backgroundColor: '#00000000'
   })
 
@@ -197,103 +266,109 @@ async function renderUnderElectron(svgPath, fill) {
   await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
   await new Promise((r) => setTimeout(r, 400))
 
-  const shot = await win.webContents.capturePage()
-  const master = shot.resize({ width: CAPTURE, height: CAPTURE, quality: 'best' })
+  const master = (await win.webContents.capturePage()).resize({
+    width: CAPTURE,
+    height: CAPTURE,
+    quality: 'best'
+  })
+  const master1024 = master.resize({ width: CANVAS, height: CANVAS, quality: 'best' })
+
+  if (options.preview) {
+    fs.writeFileSync(options.preview, master1024.toPNG())
+    checkAlpha(master1024, options, true)
+    app.quit()
+    return
+  }
+
+  fs.mkdirSync(WORK, { recursive: true })
   fs.writeFileSync(path.join(WORK, 'master.png'), master.toPNG())
 
   const iconset = path.join(WORK, 'icon.iconset')
   fs.rmSync(iconset, { recursive: true, force: true })
   fs.mkdirSync(iconset, { recursive: true })
-
   for (const [name, px] of ICONSET) {
-    // 2048 → 1024/512 是整数倍，最干净；其余档交给 nativeImage 的双三次重采样
     const image = px === CAPTURE ? master : master.resize({ width: px, height: px, quality: 'best' })
     fs.writeFileSync(path.join(iconset, name), image.toPNG())
   }
-
-  // 1024 主图单独留一份，方便肉眼检查
-  const flat = master.resize({ width: CANVAS, height: CANVAS, quality: 'best' })
-  fs.writeFileSync(path.join(BUILD, 'icon.png'), flat.toPNG())
+  fs.writeFileSync(path.join(BUILD, 'icon.png'), master1024.toPNG())
 
   app.quit()
 
-  // iconutil 必须在退出 Electron 之后跑：它是独立进程，不依赖渲染环境
   execFileSync('iconutil', ['-c', 'icns', iconset, '-o', path.join(BUILD, 'icon.icns')], {
     stdio: 'inherit'
   })
 
-  report(checkAlpha(flat))
+  checkAlpha(master1024, options, false)
   console.log(`\n图标已更新：`)
-  console.log(`  ${path.relative(ROOT, path.join(BUILD, 'icon.icns'))}   ${fs.statSync(path.join(BUILD, 'icon.icns')).size} bytes`)
-  console.log(`  ${path.relative(ROOT, path.join(BUILD, 'icon.png'))}`)
-  console.log(`  ${path.relative(ROOT, path.join(BUILD, 'icon.svg'))}`)
+  for (const f of ['icon.icns', 'icon.png', 'icon.svg']) {
+    console.log(`  ${path.relative(ROOT, path.join(BUILD, f))}  ${fs.statSync(path.join(BUILD, f)).size} bytes`)
+  }
   console.log(`\n下一步：npm run dist`)
-  void fill
 }
 
-/** 自检：方块外必须透明，中心必须是白的（鲸鱼盖住了方块中心）。 */
-function checkAlpha(image) {
-  const size = image.getSize()
+/** 自检：方块外必须透明。正方形的四角是唯一能验证连续角画对了的地方。 */
+function checkAlpha(image, options, quiet) {
+  const { width, height } = image.getSize()
   const bitmap = image.toBitmap() // BGRA
   const at = (x, y) => {
-    const i = (y * size.width + x) * 4
+    const i = (y * width + x) * 4
     return { b: bitmap[i], g: bitmap[i + 1], r: bitmap[i + 2], a: bitmap[i + 3] }
   }
-  const corners = [at(1, 1), at(size.width - 2, 1), at(1, size.height - 2), at(size.width - 2, size.height - 2)]
-  const center = at(Math.floor(size.width / 2), Math.floor(size.height / 2))
-  const tile = Math.round((TILE / CANVAS) * size.width)
-  // 取样点要落在「方块之外的留白」里：留白宽度是 (画布 - 方块)，取它的一半
-  const paddingHalf = Math.round((size.width - tile) / 4)
-  const outside = at(paddingHalf, Math.floor(size.height / 2))
-  return { corners, center, outside, size }
-}
+  const corners = [at(1, 1), at(width - 2, 1), at(1, height - 2), at(width - 2, height - 2)]
+  const side = width * options.tile
+  const pad = (width - side) / 2
+  const paddingHalf = Math.round(pad / 2)
+  const outside = at(paddingHalf, Math.floor(height / 2))
+  const center = at(Math.floor(width / 2), Math.floor(height / 2))
+  const hex = (c) => `#${[c.r, c.g, c.b].map((v) => v.toString(16).padStart(2, '0')).join('')}`
 
-function report({ corners, center, outside, size }) {
-  console.log(`\n自检（${size.width}x${size.height}）：`)
-  console.log(
-    `  四角透明: ${corners.every((c) => c.a === 0) ? '✅' : '❌ ' + JSON.stringify(corners)}`
-  )
-  console.log(`  方块外透明: ${outside.a === 0 ? '✅' : '❌ ' + JSON.stringify(outside)}`)
-  console.log(
-    `  中心是白色鲸鱼: ${
-      center.a === 255 && center.r > 250 && center.g > 250 && center.b > 250
-        ? '✅'
-        : '❌ ' + JSON.stringify(center)
-    }`
-  )
+  const ok = corners.every((c) => c.a === 0) && outside.a === 0
+  console.log(`\n自检（${width}x${height}）：`)
+  console.log(`  四角透明: ${corners.every((c) => c.a === 0) ? '✅' : '❌ ' + JSON.stringify(corners)}`)
+  console.log(`  底板外透明: ${outside.a === 0 ? '✅' : '❌ ' + JSON.stringify(outside)}`)
+  console.log(`  中心像素: ${hex(center)}（应为 ${options.fg}，鲸鱼压在这里）`)
+  if (!quiet && !ok) process.exitCode = 1
 }
 
 // ── 入口 ────────────────────────────────────────────────────────────────
 
-function main() {
-  const args = process.argv.slice(2)
-  const fillIndex = args.indexOf('--fill')
-  const fill = fillIndex >= 0 ? Number(args[fillIndex + 1]) : 0.6
-  if (!(fill > 0 && fill <= 1)) throw new Error(`--fill 要在 (0, 1] 之间，收到 ${fill}`)
-  return fill
+function parseArgs(argv) {
+  const options = { ...DEFAULTS, preview: undefined }
+  for (let i = 0; i < argv.length; i++) {
+    const key = argv[i]
+    if (key === '--preview') options.preview = argv[++i]
+    else if (key === '--fill') options.fill = Number(argv[++i])
+    else if (key === '--bg') options.bg = argv[++i]
+    else if (key === '--fg') options.fg = argv[++i]
+    else if (key === '--tile') options.tile = Number(argv[++i])
+    else throw new Error(`未知参数 ${key}`)
+  }
+  if (!(options.fill > 0 && options.fill <= 1)) throw new Error(`--fill 要在 (0,1] 之间，收到 ${options.fill}`)
+  if (!(options.tile >= 0 && options.tile <= 1)) throw new Error(`--tile 要在 [0,1] 之间，收到 ${options.tile}`)
+  return options
 }
 
-const FILL = main()
+const OPTIONS = parseArgs(process.argv.slice(2))
 
 if (process.versions.electron) {
-  // 已经在 Electron 里了 —— 直接渲染
-  void renderUnderElectron(path.join(WORK, 'icon.svg'), FILL)
+  void renderUnderElectron(path.join(WORK, 'icon.svg'), OPTIONS)
 } else {
-  // 普通 Node：取官方 path、生成 SVG，再用 electron 把自己重新拉起来
   const { file, svg } = officialLogoSvg()
   const d = extractPathData(svg)
   const bounds = glyphBounds(d)
-  const { svg: iconSvg, stats } = buildIconSvg(d, bounds, FILL)
+  const { svg: iconSvg, stats } = buildIconSvg(d, bounds, OPTIONS)
 
   fs.mkdirSync(WORK, { recursive: true })
   fs.writeFileSync(path.join(WORK, 'icon.svg'), iconSvg)
-  fs.writeFileSync(path.join(BUILD, 'icon.svg'), iconSvg)
+  if (!OPTIONS.preview) fs.writeFileSync(path.join(BUILD, 'icon.svg'), iconSvg)
 
-  console.log(`官方图形来源：${path.relative(ROOT, file)}`)
-  console.log(`官方墨迹包围盒：x [${bounds.x0.toFixed(3)}, ${bounds.x1.toFixed(3)}]  y [${bounds.y0.toFixed(3)}, ${bounds.y1.toFixed(3)}]`)
-  for (const [k, v] of Object.entries(stats)) console.log(`  ${k}：${v}`)
-  console.log()
+  if (!OPTIONS.preview) {
+    console.log(`官方图形来源：${path.relative(ROOT, file)}`)
+    for (const [k, v] of Object.entries(stats)) console.log(`  ${k}：${v}`)
+  }
 
-  const electron = require('electron') // 在普通 Node 下它导出二进制路径
-  execFileSync(electron, [__filename, '--fill', String(FILL)], { stdio: 'inherit' })
+  const electron = require('electron') // 普通 Node 下它导出二进制路径
+  const args = [__filename, '--fill', String(OPTIONS.fill), '--bg', OPTIONS.bg, '--fg', OPTIONS.fg, '--tile', String(OPTIONS.tile)]
+  if (OPTIONS.preview) args.push('--preview', OPTIONS.preview)
+  execFileSync(electron, args, { stdio: 'inherit' })
 }
