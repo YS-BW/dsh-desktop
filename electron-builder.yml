@@ -1,0 +1,54 @@
+# electron-builder 打包配置
+#
+# 关于 asar：**故意关闭**。
+#
+# 自带引擎的启动方式是 `node <bin.js>` —— 用 App 里那个真正的 node 二进制去加载
+# dsh 的入口。而 node 二进制不认识 asar 虚拟文件系统（那是 Electron 自己给它的
+# Node 加的能力），所以只要 bin.js 或它 require 的模块被塞进 app.asar，启动就会
+# 失败。同理，node 二进制本身也必须在真实文件系统上、且带可执行位。
+#
+# 关掉 asar 后一切都在真实路径上，代价只是目录结构不如单文件紧凑、启动略慢——
+# 换来的是「自带引擎能可靠启动」。
+asar: false
+
+appId: com.dsh.desktopmin
+productName: DSH Desktop Min
+
+directories:
+  output: release
+  buildResources: build
+
+# 打包进 App 的内容：壳自己 + 自带引擎（node 运行时、@deepseek-ai/dsh 及其依赖）
+files:
+  - main.js
+  - watchdog.js
+  - package.json
+
+# 这些不进包：诊断脚本、更新脚本、图标源文件（App 运行时用不到）
+extraMetadata:
+  main: main.js
+
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+
+  # 不做代码签名 —— 本机自用足够。分发时对方首次打开需要
+  # 右键 → 打开，或执行一次 `xattr -dr com.apple.quarantine`。
+  identity: null
+
+  # 深色模式下的窗口底色由应用自己处理
+  darkModeSupport: true
+
+dmg:
+  title: DSH Desktop Min
+  # 不做公证，保持简单
+  sign: false
+
+# 关掉自动更新：这个 App 的更新方式是「从 npm 拉引擎」（见 update-dsh.sh），
+# 不是 electron-builder 的发布通道。
+publish: null

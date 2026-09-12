@@ -5,10 +5,18 @@
   "description": "Minimal Electron shell that runs the stock DSH web UI in a native macOS window. No patches to dsh.",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac"
   },
   "license": "MIT",
   "devDependencies": {
-    "electron": "^44.3.0"
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.2-rc.1",
+    "node": "24.9.0"
   }
 }

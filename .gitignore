@@ -1,6 +1,9 @@
 # 依赖
 node_modules/
 
+# 打包产物（体积大，走 GitHub Release 而不是提交）
+release/
+
 # 运行期产物
 *.log
 .backend.log

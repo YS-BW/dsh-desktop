@@ -15,10 +15,11 @@
  */
 
 const { app, BrowserWindow, shell, dialog, Menu, nativeTheme } = require('electron')
-const { spawn } = require('node:child_process')
+const { spawn, execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { createRequire } = require('node:module')
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
@@ -45,23 +46,231 @@ const DEFAULT_WORKSPACE = '/Users/lixinlv/Documents/DSH'
  */
 const WORKSPACE = path.resolve(process.env.DSH_MIN_WORKSPACE || DEFAULT_WORKSPACE)
 
-/** dsh 可执行文件：优先环境变量，其次 PATH，最后常见安装位置。 */
-function resolveDshBin() {
-  if (process.env.DSH_MIN_BIN) return process.env.DSH_MIN_BIN
-  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
-    if (!dir) continue
-    const candidate = path.join(dir, 'dsh')
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK)
-      return candidate
-    } catch {}
+/**
+ * 这个桌面端自己的数据根目录（**不是** DSH 的 home）。
+ * 目前只放「从 npm 更新下来的引擎」，所以它必须可写、且在 App 包外面。
+ */
+const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
+  ? path.resolve(process.env.DSH_MIN_DESKTOP_HOME)
+  : path.join(os.homedir(), '.dsh-desktop')
+
+/**
+ * 解析后端引擎：返回 { node, bin, source } 或 undefined。
+ *
+ * 引擎策略：**自带一份 + 可从 npm 更新**。
+ *
+ *   1. 更新目录（优先）—— `~/.dsh-desktop/runtime`，由 `update-dsh.sh` 从 npm 拉。
+ *      它在 App 外面，所以升级引擎**不用重新打包、不用重新下载 App**。
+ *   2. 自带的一份 —— 打进 App 里，下载 DMG 的人**双击就能用**，无需预装任何东西。
+ *   3. DSH_MIN_BIN —— 显式覆盖，调试用。
+ *   4. 系统 dsh（PATH / 标准位置 / 登录 shell）—— 开发态与兜底。
+ *
+ * 为什么每条自带/更新路径都要连 node 一起带：dsh 的 shebang 是
+ * `#!/usr/bin/env node`，靠 PATH 找一个 node。下载 App 的人 PATH 里未必有 node
+ * （从 Finder 启动时更是只有 launchd 的最小 PATH），所以必须用自带的 node 加载
+ * bin.js，而不是把 bin.js 当可执行文件去 spawn。
+ *
+ * 为什么必须是「真 Node」而不能借 Electron 内置的那个：dsh 的 web profile 默认
+ * `patchReload: "live"`，会建 Cordis HMR 服务，而它需要 Node 内部模块加载器
+ * （--expose-internals）。Electron 跑在 utility process 里时这个标志进不了 Node 的
+ * 选项解析器，HMR 构造失败会带崩整个 profile 启动 —— 社区版为此专门写了一个
+ * hmr-fallback 插件。真 Node 没这个问题，所以这里一个插件都不用。
+ */
+function resolveEngine() {
+  if (process.env.DSH_MIN_BIN) {
+    return { node: undefined, bin: process.env.DSH_MIN_BIN, source: 'DSH_MIN_BIN' }
   }
-  const fallback = path.join(
-    os.homedir(),
-    '.hermes/node/lib/node_modules/@deepseek-ai/dsh/lib/bin.js'
+
+  // 1. 更新过的引擎（~/.dsh-desktop/runtime，由 update-dsh.sh 从 npm 拉）
+  const runtime = path.join(DESKTOP_HOME, 'runtime')
+  const updatedBin = path.join(runtime, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  const updatedNode = path.join(
+    runtime, 'node_modules', 'node', 'bin', process.platform === 'win32' ? 'node.exe' : 'node'
   )
-  return fs.existsSync(fallback) ? fallback : undefined
+  if (fs.existsSync(updatedBin)) {
+    // node 与引擎各自独立解析：更新目录里通常只有引擎（node 随 App 自带），
+    // 所以缺 node 时回落到自带的那份，而不是整个放弃更新。
+    const node = fs.existsSync(updatedNode) ? updatedNode : bundledNodePath()
+    if (node) {
+      return { node, bin: updatedBin, source: `已更新引擎 ${engineVersion(updatedBin)}` }
+    }
+  }
+
+  // 2. 自带引擎
+  const bundledBin = bundledDshEntry()
+  const bundledNode = bundledNodePath()
+  if (bundledBin && bundledNode) {
+    return { node: bundledNode, bin: bundledBin, source: `自带引擎 ${engineVersion(bundledBin)}` }
+  }
+
+  // 3-4. 开发态 / 兜底：系统里的 dsh
+  for (const location of standardDshLocations()) {
+    if (isExecutable(location)) return { node: undefined, bin: location, source: '系统 dsh' }
+  }
+  const fromPath = findExecutableIn(process.env.PATH || '', 'dsh')
+  if (fromPath) return { node: undefined, bin: fromPath, source: 'PATH 上的 dsh' }
+  const fromShell = findExecutableIn(loginShellPath() || '', 'dsh')
+  if (fromShell) return { node: undefined, bin: fromShell, source: '登录 shell 里的 dsh' }
+
+  return undefined
 }
+
+/** 读引擎版本号，只用于日志。读不到就返回「未知版本」。 */
+function engineVersion(binPath) {
+  try {
+    const manifest = path.join(path.dirname(binPath), '..', 'package.json')
+    return JSON.parse(fs.readFileSync(manifest, 'utf8')).version || '未知版本'
+  } catch {
+    return '未知版本'
+  }
+}
+
+/** 自带的 Node 运行时（随 App 打包）。 */
+function bundledNodePath() {
+  const name = process.platform === 'win32' ? 'node.exe' : 'node'
+  try {
+    const require = createRequire(path.join(app.getAppPath(), 'package.json'))
+    const node = path.join(path.dirname(require.resolve('node/package.json')), 'bin', name)
+    return fs.existsSync(node) ? node : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 打进 App 的 dsh 入口。
+ *
+ * 版本号不写死：用 createRequire 从 node_modules 里解析，升级自带版本时不用改代码。
+ */
+function bundledDshEntry() {
+  try {
+    const base = app.isPackaged
+      ? path.join(app.getAppPath(), 'package.json')
+      : __filename
+    const require = createRequire(base)
+    return require.resolve('@deepseek-ai/dsh/lib/bin.js')
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * npm 全局安装 dsh 后，可执行文件最可能出现的位置。
+ *
+ * npm 的全局 bin 目录随 prefix 变化，常见形态有：
+ *   /usr/local/bin、/opt/homebrew/bin      —— Homebrew 的 node
+ *   ~/.npm-global/bin、~/.local/bin        —— 常见的用户级 prefix
+ *   ~/.nvm/versions/node/<版本>/bin        —— nvm
+ *   ~/.volta/bin                           —— volta
+ * 另外也直接找包目录，跳过可能缺失的 shim。
+ */
+function standardDshLocations() {
+  const home = os.homedir()
+  const binDirs = [
+    '/usr/local/bin',
+    '/opt/homebrew/bin',
+    path.join(home, '.npm-global', 'bin'),
+    path.join(home, '.local', 'bin'),
+    path.join(home, '.volta', 'bin'),
+    path.join(home, '.bun', 'bin'),
+    path.join(home, '.nodenv', 'shims')
+  ]
+
+  // nvm：每个已安装版本一个 bin 目录
+  try {
+    const nvmVersions = path.join(home, '.nvm', 'versions', 'node')
+    for (const version of fs.readdirSync(nvmVersions)) {
+      binDirs.push(path.join(nvmVersions, version, 'bin'))
+    }
+  } catch {}
+
+  const locations = []
+  for (const dir of binDirs) locations.push(path.join(dir, 'dsh'))
+
+  // 直接指向包入口，跳过 shim
+  const moduleRoots = [
+    '/usr/local/lib/node_modules',
+    '/opt/homebrew/lib/node_modules',
+    path.join(home, '.npm-global', 'lib', 'node_modules'),
+    path.join(home, '.local', 'lib', 'node_modules')
+  ]
+  for (const root of moduleRoots) {
+    locations.push(path.join(root, '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
+  }
+
+  return locations
+}
+
+/**
+ * 子进程要用的环境变量。
+ *
+ * 找到 dsh 还不够：它的 shebang 是 `#!/usr/bin/env node`，需要 PATH 里有 node。
+ * 从 Finder/启动台启动时，应用只有 launchd 的最小 PATH（/usr/bin:/bin:/usr/sbin:/sbin），
+ * 里面没有 node，dsh 会直接以 127（command not found）退出。
+ *
+ * 所以这里在必要时把登录 shell 的 PATH 并进来 —— 仍属兜底，只在 PATH 看起来
+ * 「不像用户环境」时才去问 shell。
+ */
+function backendEnv() {
+  const env = { ...process.env, DSH_HOME, NO_COLOR: '1' }
+  if (needsShellPath()) {
+    const fromShell = loginShellPath()
+    if (fromShell) env.PATH = fromShell
+  }
+  return env
+}
+
+/** 当前 PATH 像是从 Finder 启动的（不含用户级目录）时返回 true。 */
+function needsShellPath() {
+  const current = process.env.PATH || ''
+  if (!current.includes('/usr/bin')) return false
+  // 只要 PATH 里出现了典型的用户级目录，就认为是从终端启动的，不必再问 shell。
+  return !['.nvm', 'homebrew', '.local/bin', '.hermes', '.volta', '.bun']
+    .some((marker) => current.includes(marker))
+}
+
+/**
+ * 向登录 shell 要一份 PATH（结果缓存，最多问一次）。
+ *
+ * 为什么要给标记再截取：用户的 rc 文件常有 `echo`、版本管理器提示之类的东西会污染
+ * stdout，而我们只要那一行。同时给 5 秒超时，避免某个 rc 文件卡住把应用启动拖死。
+ */
+let cachedShellPath
+function loginShellPath() {
+  if (cachedShellPath !== undefined) return cachedShellPath
+
+  cachedShellPath = undefined
+  const shell = process.env.SHELL || '/bin/zsh'
+  try {
+    const output = execFileSync(shell, ['-lic', 'echo "__DSH_PATH__$PATH"'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+    const value = output.match(/__DSH_PATH__(.+)/)?.[1]?.trim()
+    if (value && value.includes('/')) cachedShellPath = value
+  } catch {}
+  return cachedShellPath
+}
+
+function findExecutableIn(searchPath, name) {
+  for (const dir of searchPath.split(path.delimiter)) {
+    if (!dir) continue
+    const candidate = path.join(dir, name)
+    if (isExecutable(candidate)) return candidate
+  }
+  return undefined
+}
+
+function isExecutable(candidate) {
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 
 // ── 运行状态 ────────────────────────────────────────────────────────────
 
@@ -114,11 +323,12 @@ function extractAuthenticatedUrl(text) {
 const stripAnsi = (s) => s.replace(/\u001B\[[0-9;]*m/g, '')
 
 function startBackend(port) {
-  const bin = resolveDshBin()
-  if (!bin) {
+  const engine = resolveEngine()
+  if (!engine) {
     dialog.showErrorBox(
-      '找不到 dsh',
-      '请先安装 DeepSeek Harness，或用 DSH_MIN_BIN 指定 dsh 的路径。'
+      '找不到 dsh 引擎',
+      '这个 App 自带引擎，正常情况下不该出现这个提示。\n\n' +
+        '请重新下载安装包，或用 DSH_MIN_BIN 环境变量指定 dsh 的路径。'
     )
     app.quit()
     return
@@ -135,13 +345,17 @@ function startBackend(port) {
     String(port)
   ]
 
-  log('启动后端:', bin, args.join(' '))
+  // 自带/更新的引擎：node <bin.js> web ...；系统 dsh：dsh web ...
+  const command = engine.node ?? engine.bin
+  const argv = engine.node ? [engine.bin, ...args] : args
+
+  log(`启动后端（${engine.source}）:`, command, argv.join(' '))
   log('  DSH_HOME =', DSH_HOME)
   log('  cwd      =', WORKSPACE)
 
-  child = spawn(bin, args, {
+  child = spawn(command, argv, {
     cwd: WORKSPACE,
-    env: { ...process.env, DSH_HOME, NO_COLOR: '1' },
+    env: backendEnv(),
     stdio: ['ignore', 'pipe', 'pipe']
   })
 
