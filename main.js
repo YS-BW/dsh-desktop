@@ -1087,6 +1087,22 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.whenReady().then(() => {
+    // 通知自检：DSH_MIN_TEST_NOTIFY=1 时弹一条测试通知，把投递结果打到日志。
+    // 用来验证「打包后的 .app 能不能弹 macOS 通知」—— 开发态会因缺少 app bundle 授权而失败。
+    if (process.env.DSH_MIN_TEST_NOTIFY) {
+      const { Notification } = require('electron')
+      log('通知自检：isSupported =', Notification.isSupported())
+      const n = new Notification({
+        title: 'DSH Desktop Min',
+        body: '通知自检：如果你看到这条，说明通知可用。',
+        subtitle: 'dsh-desktop'
+      })
+      n.on('show', () => log('通知自检：show（已投递）'))
+      n.on('failed', (_e, err) => log('通知自检：failed →', String(err)))
+      n.on('click', () => log('通知自检：click'))
+      n.show()
+    }
+
     buildMenu()
     createWindow()
 

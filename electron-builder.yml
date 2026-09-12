@@ -38,9 +38,15 @@ mac:
     - target: zip
       arch: [arm64]
 
-  # 不做代码签名 —— 本机自用足够。分发时对方首次打开需要
-  # 右键 → 打开，或执行一次 `xattr -dr com.apple.quarantine`。
-  identity: null
+  # 用 ad-hoc 签名（不需要开发者证书）。
+  #
+  # 为什么不能设成 null：那样 electron-builder 会完全跳过签名，二进制只留下链接器的
+  # 临时签名（codesign 显示 flags=adhoc,linker-signed、Identifier=Electron）。实测在这种
+  # 状态下 macOS 会拒绝投递通知，报 UNErrorDomain 错误 1；改成正确的 ad-hoc 签名
+  # （Identifier = 本 bundle id）之后通知立刻可用。
+  #
+  # 仍然没有公证，所以分发时对方首次打开需要右键 → 打开，或清一次隔离属性。
+  identity: '-' 
 
   # 深色模式下的窗口底色由应用自己处理
   darkModeSupport: true
