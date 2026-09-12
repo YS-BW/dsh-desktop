@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-min",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "Minimal Electron shell that runs the stock DSH web UI in a native macOS window. No patches to dsh.",
   "main": "main.js",
@@ -18,7 +18,7 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.1.2-rc.1",
+    "@deepseek-ai/dsh": "0.1.5-rc.1",
     "node": "24.9.0",
     "npm": "11.19.1"
   }
