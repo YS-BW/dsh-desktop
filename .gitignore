@@ -1,0 +1,10 @@
+# 依赖
+node_modules/
+
+# 运行期产物
+*.log
+diagnose-report.json
+dragtest-result.json
+
+# macOS
+.DS_Store
