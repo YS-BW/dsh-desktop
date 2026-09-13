@@ -50,10 +50,22 @@ const {
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
-/** DSH 数据目录。默认 ~/.dsh，与命令行 dsh 完全共用，所以会话/配置/凭据互通。 */
+/** Desktop 自己的数据根目录。引擎和独立导入的 DSH 数据都放在这里。 */
+const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
+  ? path.resolve(process.env.DSH_MIN_DESKTOP_HOME)
+  : path.join(os.homedir(), '.dsh-desktop')
+
+/**
+ * DSH 数据目录。显式传入 DSH_MIN_HOME 时始终尊重它；否则优先使用已经导入的
+ * Desktop 专属数据目录，避免 Desktop 和命令行 Web 实例同时写同一份会话日志。
+ * 尚未导入过数据的安装继续兼容原有 ~/.dsh 行为。
+ */
+const IMPORTED_DSH_HOME = path.join(DESKTOP_HOME, 'dsh-home')
 const DSH_HOME = process.env.DSH_MIN_HOME
   ? path.resolve(process.env.DSH_MIN_HOME)
-  : path.join(os.homedir(), '.dsh')
+  : fs.existsSync(IMPORTED_DSH_HOME)
+    ? IMPORTED_DSH_HOME
+    : path.join(os.homedir(), '.dsh')
 
 /**
  * 默认工作目录。
@@ -72,14 +84,6 @@ const DEFAULT_WORKSPACE = path.join(os.homedir(), 'Documents', 'DSH')
  * 要和网页端看到同一批会话，这个路径必须和你在网页端启动 dsh 时的目录一致。
  */
 const WORKSPACE = path.resolve(process.env.DSH_MIN_WORKSPACE || DEFAULT_WORKSPACE)
-
-/**
- * 这个桌面端自己的数据根目录（**不是** DSH 的 home）。
- * 目前只放「从 npm 更新下来的引擎」，所以它必须可写、且在 App 包外面。
- */
-const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
-  ? path.resolve(process.env.DSH_MIN_DESKTOP_HOME)
-  : path.join(os.homedir(), '.dsh-desktop')
 
 /**
  * 解析后端引擎：返回 { node, bin, source } 或 undefined。
