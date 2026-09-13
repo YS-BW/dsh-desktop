@@ -41,7 +41,11 @@ const {
   findExecutableIn,
   isExecutableFile,
   killProcessTree,
-  choosePort
+  choosePort,
+  // backendEnv() 在「像是从 Finder 启动」时用它把登录 shell 的 PATH 写进去。
+  // 漏掉这一项会让双击启动直接 ReferenceError —— 而且终端里跑永远发现不了，
+  // 因为那时 needsShellPath() 是 false，这条分支根本不执行。
+  setEnvPath
 } = require('./platform')
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
