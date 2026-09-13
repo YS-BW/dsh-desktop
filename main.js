@@ -3,10 +3,11 @@
 /**
  * dsh-desktop-min — 把官方 DSH Web UI 装进一个原生 macOS 窗口。
  *
- * 这个壳对 dsh 的唯一依赖是三个公开约定，一行都不改 dsh 的源码：
+ * 这个壳对 dsh 的唯一依赖是四个公开约定，一行都不改 dsh 的源码：
  *   1. 命令行:   dsh web --no-open --host 127.0.0.1 --port <n>
- *   2. 环境变量: DSH_HOME（数据目录）、cwd（工作目录，决定会话分区）
- *   3. stdout:  启动时打印一行 `dsh web: <带 token 的 URL>`
+ *   2. 命令行:   dsh web --patch <组合覆盖层>（固定 Desktop 的目录选择交互）
+ *   3. 环境变量: DSH_HOME（数据目录）、cwd（工作目录，决定会话分区）
+ *   4. stdout:  启动时打印一行 `dsh web: <带 token 的 URL>`
  *
  * 之所以能用「真 Node 二进制」而不是 Electron 内置 Node：内置 Node 跑在
  * utility process 里时 `--expose-internals` 进不了 Node 的选项解析器，
@@ -53,6 +54,16 @@ const {
 
 /** Desktop 自己的数据根目录。引擎等应用数据放在这里。 */
 const DESKTOP_HOME = resolveDesktopHome()
+
+/**
+ * Desktop 内嵌 Web UI 时，固定使用 DSH 官方的应用内目录选择器。
+ *
+ * 不能把 macOS/Windows 的自动选择器交给后端子进程：它会打开系统对话框，
+ * 但对话框不一定能切到 Electron 窗口前面，用户会误以为「添加工作区」没有反应。
+ * 这个文件是 `dsh web --patch` 支持的组合覆盖层，只挂载上游已有的浏览组件；
+ * 不修改 dsh 包，也不写入共用的 DSH_HOME。
+ */
+const DESKTOP_DIRECTORY_PICKER_PATCH = path.join(__dirname, 'desktop-directory-picker.patch.yml')
 
 /**
  * DSH 数据目录。默认与命令行 dsh 共用 ~/.dsh，因此在停止 Web 后，Desktop 可以
@@ -643,6 +654,8 @@ function startBackend(port) {
 
     const args = [
       'web',
+      '--patch',
+      DESKTOP_DIRECTORY_PICKER_PATCH,
       '--no-open', // 窗口就是唯一的界面，不要再弹浏览器
       '--host',
       '127.0.0.1',

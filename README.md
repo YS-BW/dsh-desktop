@@ -11,7 +11,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-171513.svg" /></a>
   <img alt="macOS" src="https://img.shields.io/badge/macOS-Apple%20Silicon-171513.svg" />
   <img alt="Windows" src="https://img.shields.io/badge/Windows-x64-171513.svg" />
-  <img alt="Patches" src="https://img.shields.io/badge/patches-0-171513.svg" />
+  <img alt="Source patches" src="https://img.shields.io/badge/source%20patches-0-171513.svg" />
   <img alt="Shell" src="https://img.shields.io/badge/shell-~4k%20lines-171513.svg" />
 </p>
 
@@ -19,7 +19,7 @@
 
 <p align="center"><strong>自动拉起本地 Harness，把官方界面放进原生窗口，会话与配置和命令行 <code>dsh</code> 完全互通；升级引擎直接从 npm 拉，不需要重新下载 App。</strong></p>
 
-DSH Desktop Min 不重新实现任何界面，也不修改 Harness 的任何文件。它只做一件事：把 `dsh web` 已经提供的那个界面，装进一个正常的桌面窗口里。壳与 Harness 之间只有**三个公开约定** —— 一个子命令、一个环境变量、一行 stdout。
+DSH Desktop Min 不重新实现任何界面，也不修改 Harness 的任何文件。它只做一件事：把 `dsh web` 已经提供的那个界面，装进一个正常的桌面窗口里。壳只使用 DSH 的公开 CLI、环境变量、启动 stdout，以及官方支持的 `--patch` 组合覆盖层；后者仅把 Desktop 的工作区目录选择固定为 DSH 自带的应用内浏览器。
 
 > [!IMPORTANT]
 > **未做代码签名与公证。** macOS 首次打开会拦下来，右键点 App → **打开** 即可，或执行一次 `xattr -dr com.apple.quarantine "/Applications/DSH Desktop Min.app"`。Windows 安装包未签名，SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」。
@@ -57,7 +57,7 @@ Harness 已经提供了 Agent Runtime 和 Web UI。这个壳补齐的是网页�
 
 这个项目的取舍全写在名字里的 **min** 上。
 
-**一、只依赖公开约定，不打补丁。** 壳和 Harness 之间只有三样东西：`web --no-open --host 127.0.0.1 --port <n>` 这个子命令、`DSH_HOME` 环境变量、以及启动时 stdout 上的那一行 `dsh web: <带 token 的 URL>`。所以**官方怎么升级都不会破坏这个壳**。
+**一、只依赖公开约定，不修改源码。** 壳通过 `web --no-open --host 127.0.0.1 --port <n>` 启动 DSH，使用 `DSH_HOME` 共享数据，读取启动时 stdout 的 URL；同时用官方 `--patch` 参数提供一份静态组合覆盖层，把嵌入式 Desktop 的目录选择固定为 DSH 自带的应用内浏览器。这份覆盖层不改写 DSH 文件，也不写入用户的 `~/.dsh`。
 
 **二、引擎在 App 外面，可独立升级。** 升级过的引擎装在 `~/.dsh-desktop/engines/<版本>/`，版本化目录使得正在跑的那份全程只读。新版本先在隔离环境里过三道关卡（包完整、配置能组装、真能冷启动），通过了才切指针。
 
@@ -86,7 +86,7 @@ Harness 已经提供了 Agent Runtime 和 Web UI。这个壳补齐的是网页�
 
 社区主流做法是 **vendor 整份 Harness + 叠一层补丁**，功能多得多（手机配对、PPT 生成、安全模式、插件市场），代价是上游每动一次都要跟一次 —— 它们的文档目录里有四份 `harness-*-upgrade.md` 迁移文档。
 
-这个项目走的是另一边：Harness 是一个普通 npm 依赖，壳只依赖那三个公开约定。**功能面窄得多，也没有公证；换来的是上游怎么升都不痛。**
+这个项目走的是另一边：Harness 是一个普通 npm 依赖，壳只依赖公开接口和一份官方支持的组合覆盖层。**功能面窄得多，也没有公证；换来的是上游怎么升都不痛。**
 
 完整对照（含「为什么这条路上不需要 `hmr-fallback`」）见[兼容性与边界](docs/compatibility.md)。
 

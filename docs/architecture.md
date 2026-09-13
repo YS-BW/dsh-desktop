@@ -9,7 +9,7 @@
 窗口里加载的就是 `dsh web` 提供的那个官方 Web UI，和你浏览器里看到的是同一套前端。
 
 ```
-Electron 壳  ──spawn──>  node <dsh>/lib/bin.js web --no-open --host 127.0.0.1 --port 0
+Electron 壳  ──spawn──>  node <dsh>/lib/bin.js web --patch <Desktop 覆盖层> --no-open --host 127.0.0.1 --port 0
      │                              │
      │  ← 读 stdout 拿到 URL ← ──────┘  打印 "dsh web: http://127.0.0.1:PORT/?token=..."
      └─ 把那个 URL 加载进窗口
@@ -19,7 +19,7 @@ Electron 壳  ──spawn──>  node <dsh>/lib/bin.js web --no-open --host 127
 
 | 约定 | 内容 |
 |---|---|
-| 命令行 | `web --no-open --host 127.0.0.1 --port <n>` |
+| 命令行 | `web --patch <Desktop 覆盖层> --no-open --host 127.0.0.1 --port <n>` |
 | 插件命令 | `plugin --profile web <pnpm args>`、`--profile web --dump-config` |
 | 环境变量 | `DSH_HOME`（数据目录）、进程 cwd（工作目录） |
 | stdout | 启动时那一行 `dsh web: <带 token 的 URL>` |
@@ -88,4 +88,3 @@ DSH 自己给了 5 秒排空宽限（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3`），�
 |---|---|---|---|
 | 展开 | 280px | 品牌标 y=57 | ✅ |
 | 折叠 | 56px | 折叠按钮 y=48 | ✅ |
-

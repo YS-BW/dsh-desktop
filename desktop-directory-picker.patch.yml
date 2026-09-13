@@ -1,0 +1,15 @@
+# DSH Desktop Min runs the Web UI inside Electron.  The stock adaptive picker
+# selects the host-native dialog on macOS/Windows, but that dialog belongs to
+# the backend child process and may not be focused above the Electron window.
+#
+# Pin DSH's own browse implementation instead.  It renders the folder chooser
+# inside the official Web UI and works uniformly on macOS and Windows.  This is
+# a documented `dsh web --patch` composition overlay; it neither modifies the
+# DSH package nor writes to the shared DSH_HOME.
+- id: directory-picker
+  disabled: true
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: ui-directory-picker-browse
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'

@@ -78,6 +78,19 @@ test('every module the shell requires at runtime is listed in the package files'
   }
 })
 
+test('the Desktop directory-picker overlay is shipped with the app', () => {
+  const yml = read('electron-builder.yml')
+  assert.match(
+    yml,
+    /^\s*-\s*desktop-directory-picker\.patch\.yml\s*$/m,
+    '启动 DSH 时传入的目录选择器覆盖层必须进入安装包'
+  )
+  assert.ok(
+    fs.existsSync(path.join(ROOT, 'desktop-directory-picker.patch.yml')),
+    '目录选择器覆盖层文件必须存在'
+  )
+})
+
 test('Windows packaging keeps the notification prerequisite', () => {
   const yml = read('electron-builder.yml')
   // Windows toast 需要 AppUserModelID + 开始菜单快捷方式；
