@@ -138,7 +138,11 @@ nsis:
   createStartMenuShortcut: true
   createDesktopShortcut: true
   shortcutName: DSH Desktop Min
-  artifactName: ${productName}-${version}-setup.${ext}
+  # 与已发布的 macOS 资产命名保持一致（点号分隔 + 架构）：
+  #   DSH.Desktop.Min-0.5.0-x64-setup.exe
+  #   DSH.Desktop.Min-0.5.0-arm64.dmg
+  # 默认模板会用 productName（带空格），GitHub 上会变成 %20，看着别扭。
+  artifactName: DSH.Desktop.Min-${version}-x64-setup.${ext}
 
 # 关掉自动更新：这个 App 的更新方式是「原生菜单栏从 npm 拉引擎」（见 README 的「引擎」一节），
 # 不是 electron-builder 的发布通道。
