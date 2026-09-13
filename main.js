@@ -50,22 +50,18 @@ const {
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
-/** Desktop 自己的数据根目录。引擎和独立导入的 DSH 数据都放在这里。 */
+/** Desktop 自己的数据根目录。引擎等应用数据放在这里。 */
 const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
   ? path.resolve(process.env.DSH_MIN_DESKTOP_HOME)
   : path.join(os.homedir(), '.dsh-desktop')
 
 /**
- * DSH 数据目录。显式传入 DSH_MIN_HOME 时始终尊重它；否则优先使用已经导入的
- * Desktop 专属数据目录，避免 Desktop 和命令行 Web 实例同时写同一份会话日志。
- * 尚未导入过数据的安装继续兼容原有 ~/.dsh 行为。
+ * DSH 数据目录。默认与命令行 dsh 共用 ~/.dsh，因此在停止 Web 后，Desktop 可以
+ * 直接接着同一批会话继续工作。DSH_MIN_HOME 仅用于明确指定另一份数据目录。
  */
-const IMPORTED_DSH_HOME = path.join(DESKTOP_HOME, 'dsh-home')
 const DSH_HOME = process.env.DSH_MIN_HOME
   ? path.resolve(process.env.DSH_MIN_HOME)
-  : fs.existsSync(IMPORTED_DSH_HOME)
-    ? IMPORTED_DSH_HOME
-    : path.join(os.homedir(), '.dsh')
+  : path.join(os.homedir(), '.dsh')
 
 /**
  * 默认工作目录。
