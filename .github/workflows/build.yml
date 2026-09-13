@@ -1,0 +1,158 @@
+name: build
+
+# 一个标签同时产出 macOS 和 Windows 两个平台的安装包。
+#
+# 为什么必须在 CI 上分开构建、不能从 macOS 交叉打 Windows 包：
+#
+#   1. 打包工具跑不起来。electron-builder 拉下来的 NSIS makensis 是 x86_64 版，
+#      在本项目的 arm64 开发机上直接 EBADARCH：
+#        Cannot spawn .../nsis-3.0.4.1/mac/makensis: Unknown system error -86
+#   2. 就算跑起来，包里装的也是错平台的原生二进制。自带引擎是用
+#      **一个真正的 node 二进制**跑的（见 README 的架构说明），而
+#      `node installArchSpecificPackage` 只会装当前平台那一份 —— 在 macOS 上
+#      打出来的 Windows 包里会是一个 Mach-O 的 node，Windows 上根本起不来。
+#      同理还有 node-addon-require-builtin-<platform> 这类按平台选的包。
+#
+#   所以每个平台的安装包，都必须在对应平台的 runner 上 `npm ci` + 打包。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要产出安装包的标签（例如 v0.5.1）。留空则只构建、不发布。'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ── macOS（Apple Silicon）────────────────────────────────────────────
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # postinstall 会装下 darwin-arm64 的 node 二进制 —— 这一步不能省，
+      # 自带引擎靠它启动。
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 跑测试
+        run: npm test
+
+      - name: 打包
+        run: npm run dist:mac
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      # 安装包必须真的能起 —— 光测 unpacked 会被 Node 的模块向上回溯掩盖。
+      - name: 验收安装包（引擎完整性）
+        run: |
+          set -euo pipefail
+          APP="release/mac-arm64/DSH Desktop Min.app/Contents/Resources/app"
+          dev=$(ls -d node_modules/@deepseek-ai/*/ | wc -l | tr -d ' ')
+          pkg=$(ls -d "$APP"/node_modules/@deepseek-ai/*/ | wc -l | tr -d ' ')
+          echo "开发态 $dev 个包 / 包内 $pkg 个"
+          if [ "$dev" != "$pkg" ]; then
+            echo "❌ 引擎包数量不一致，安装包缺包"
+            comm -23 <(ls node_modules/@deepseek-ai/ | sort) <(ls "$APP"/node_modules/@deepseek-ai/ | sort)
+            exit 1
+          fi
+          # 真正跑一次引擎入口 —— 缺任何无条件 import 的包都会在这里炸
+          "$APP/node_modules/node/bin/node" "$APP/node_modules/@deepseek-ai/dsh/lib/bin.js" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+
+  # ── Windows x64 ────────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 同样要靠 postinstall 装下 win32-x64 的 node 二进制
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 跑测试
+        run: npm test
+        shell: bash
+
+      - name: 打包
+        run: npx electron-builder --win --x64
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: 验收安装包（引擎完整性）
+        run: |
+          set -euo pipefail
+          APP="release/win-unpacked/resources/app"
+          dev=$(ls -d node_modules/@deepseek-ai/*/ | wc -l | tr -d ' ')
+          pkg=$(ls -d "$APP"/node_modules/@deepseek-ai/*/ | wc -l | tr -d ' ')
+          echo "开发态 $dev 个包 / 包内 $pkg 个"
+          if [ "$dev" != "$pkg" ]; then
+            echo "❌ 引擎包数量不一致，安装包缺包"
+            comm -23 <(ls node_modules/@deepseek-ai/ | sort) <(ls "$APP"/node_modules/@deepseek-ai/ | sort)
+            exit 1
+          fi
+          # win32 的 node.exe 必须真的是 PE 可执行文件，不能是别的平台漏进来的
+          file "$APP/node_modules/node/bin/node.exe" || true
+          "$APP/node_modules/node/bin/node.exe" "$APP/node_modules/@deepseek-ai/dsh/lib/bin.js" --version
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            release/*.exe
+            release/*.zip
+          if-no-files-found: warn
+
+  # ── 汇总并发到 Release ──────────────────────────────────────────────
+  release:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || inputs.tag != ''
+    steps:
+      - name: 取出标签
+        id: tag
+        run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 列出产物
+        run: find dist -type f | sort
+
+      - name: 挂到 Release 上
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.name }}"
+          files=$(find dist -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) | sort)
+          echo "标签 $TAG，共 $(echo "$files" | wc -l) 个文件"
+          # 已经建好的 release 就直接补传；没有就新建
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" $files --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" $files --title "$TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi
