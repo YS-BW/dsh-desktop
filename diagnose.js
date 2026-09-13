@@ -83,7 +83,7 @@ app.whenReady().then(async () => {
   const child = spawn(
     process.env.DSH_MIN_BIN || 'dsh',
     ['web', '--no-open', '--host', '127.0.0.1', '--port', '0'],
-    { cwd: WORKSPACE, env: { ...process.env, DSH_HOME, NO_COLOR: '1' }, stdio: ['ignore', 'pipe', 'pipe'] }
+    { cwd: WORKSPACE, env: { ...process.env, DSH_HOME, NO_COLOR: '1' }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
   )
 
   let done = false

@@ -4,32 +4,42 @@
 </h1>
 
 <p align="center">
-  把 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的官方 Web UI 装进一个原生 macOS 窗口 —— 不打补丁，不重写前端。
+  把 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的官方 Web UI 装进一个原生桌面窗口 —— 不打补丁，不重写前端。
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-171513.svg" /></a>
   <img alt="macOS" src="https://img.shields.io/badge/macOS-Apple%20Silicon-171513.svg" />
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-x64-171513.svg" />
   <img alt="Patches" src="https://img.shields.io/badge/patches-0-171513.svg" />
-  <img alt="Shell" src="https://img.shields.io/badge/shell-~3.6k%20lines-171513.svg" />
+  <img alt="Shell" src="https://img.shields.io/badge/shell-~4k%20lines-171513.svg" />
 </p>
 
-![DSH Desktop Min：官方 Harness Web UI 跑在原生 macOS 窗口里](docs/images/hero.png)
+![DSH Desktop Min：官方 Harness Web UI 跑在原生桌面窗口里](docs/images/hero.png)
 
 <p align="center"><strong>自动拉起本地 Harness，把官方界面放进原生窗口，会话与配置和命令行 <code>dsh</code> 完全互通；升级引擎直接从 npm 拉，不需要重新下载 App。</strong></p>
 
 DSH Desktop Min 不重新实现任何界面，也不修改 Harness 的任何文件。它只做一件事：把 `dsh web` 已经提供的那个界面，装进一个正常的桌面窗口里。壳与 Harness 之间只有**三个公开约定** —— 一个子命令、一个环境变量、一行 stdout。
 
 > [!IMPORTANT]
-> **未做代码签名与公证。** macOS 首次打开会拦下来，右键点 App → **打开** 即可，或执行一次 `xattr -dr com.apple.quarantine "/Applications/DSH Desktop Min.app"`。只提供 **macOS Apple Silicon (arm64)** 构建。
+> **未做代码签名与公证。** macOS 首次打开会拦下来，右键点 App → **打开** 即可，或执行一次 `xattr -dr com.apple.quarantine "/Applications/DSH Desktop Min.app"`。Windows 安装包未签名，SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」。
+> 提供 **macOS Apple Silicon (arm64)** 与 **Windows (x64)** 构建。
 
 ## 下载安装
 
-从 [Releases](../../releases) 下载 DMG，拖进「应用程序」即可。App **自带一份引擎**，所以不需要预装 Node.js 或 dsh，双击就能用。
+从 [Releases](../../releases) 下载对应平台的安装包：macOS 是 DMG（拖进「应用程序」），Windows 是 `setup.exe`（每用户安装，**不需要管理员权限**，会建开始菜单快捷方式）。App **自带一份引擎**，所以不需要预装 Node.js 或 dsh，双击就能用。
 
 首次启动、或 App 被覆盖重装后，会先出现一次**可选的初始化向导**，让你挑要不要装社区插件；**默认一个都不勾选**，点「跳过」就直接进入官方界面。
 
 已经用命令行 `dsh` 的人不需要做任何迁移：这个 App **默认共用 `~/.dsh`**，所以终端里的会话、凭据、设置全都在。
+
+### Windows 上的行为
+
+- **关窗 = 收进托盘**，不退出应用 —— 后端与正在跑的长任务继续。从**托盘图标右键 → 退出**（或 `Alt` 唤出菜单 → 文件 → 退出）才真正退出；左键点托盘图标唤回窗口。
+- **原生标题栏被隐藏**，顶部只留系统的三个窗口按钮（最小化 / 最大化 / 关闭），内容贴到窗口最上面。
+- **菜单栏默认收起**，按 `Alt` 唤出。
+- 与 macOS 一致：**共用 `%USERPROFILE%\.dsh`**，所以和终端里的 `dsh` 是同一份会话与配置。
+
 
 ## DSH Desktop Min 带来了什么
 
@@ -58,8 +68,8 @@ Harness 已经提供了 Agent Runtime 和 Web UI。这个壳补齐的是网页�
 | 平台 | 分发形式 | 状态 |
 | --- | --- | --- |
 | macOS Apple Silicon | DMG / ZIP（ad-hoc 签名，未公证）| 支持 |
+| Windows x64 | `setup.exe`（NSIS，未签名）| 支持 |
 | macOS Intel | — | 当前不支持 |
-| Windows | — | 当前不支持 |
 | Linux | — | 当前不支持 |
 
 ## 本地数据与安全边界

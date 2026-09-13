@@ -27,6 +27,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
+const { killProcessTree } = require('./platform')
+
 /** npm 包名。升级的就是这一个包（它会把前端和 500 个依赖一起带进来）。 */
 const PACKAGE = '@deepseek-ai/dsh'
 
@@ -277,15 +279,17 @@ function createUpdater(options) {
       const child = spawn(nodePath, args, {
         cwd: runOptions.cwd,
         env: childEnv(runOptions.env),
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Windows:node.exe 是控制台程序,而壳是 GUI 进程 —— 少了这个标志,
+        // 每次跑 npm / 关卡都会在屏幕上弹一个控制台窗口。
+        windowsHide: true
       })
       let stdout = ''
       let stderr = ''
       const timer = runOptions.timeoutMs
         ? setTimeout(() => {
-            try {
-              child.kill('SIGKILL')
-            } catch {}
+            // 超时的 npm/node 也可能带着子进程，按平台语义收干净
+            stopTemporary(child)
           }, runOptions.timeoutMs)
         : undefined
 
@@ -310,6 +314,21 @@ function createUpdater(options) {
 
   function runNpm(args, runOptions = {}) {
     return runNode([npmCliPath, ...args], runOptions)
+  }
+
+  /**
+   * 结束一个临时引擎实例（关卡用的冷启动）。
+   *
+   * Windows：`child.kill('SIGTERM')` 在那边就是 TerminateProcess，而且收不掉它派生的
+   * 子孙进程（profile 起来之后会挂载工具、webserver 等），所以走 taskkill /t。
+   * POSIX：**保持原来的信号语义** —— 调用方先给 SIGTERM 让它排空，超时再 SIGKILL。
+   */
+  function stopTemporary(target, signal = 'SIGKILL') {
+    if (!target || target.exitCode !== null) return
+    if (process.platform === 'win32' && killProcessTree(target.pid, { force: true })) return
+    try {
+      target.kill(signal)
+    } catch {}
   }
 
   // ── 检测 ────────────────────────────────────────────────────────────
@@ -464,7 +483,7 @@ function createUpdater(options) {
       const child = spawn(
         nodePath,
         [bin, 'web', '--no-open', '--host', '127.0.0.1', '--port', '0'],
-        { env: childEnv(env), cwd: os.tmpdir(), stdio: ['ignore', 'pipe', 'pipe'] }
+        { env: childEnv(env), cwd: os.tmpdir(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
       )
       let output = ''
       let settled = false
@@ -473,14 +492,11 @@ function createUpdater(options) {
         if (settled) return
         settled = true
         clearTimeout(timer)
-        try {
-          child.kill('SIGTERM')
-        } catch {}
-        // 给它一点时间排空；排空不完也无所谓，这是临时实例
+        // 先给 SIGTERM 让它排空（POSIX）；Windows 上 taskkill 直接生效，不接受信号语义。
+        stopTemporary(child, 'SIGTERM')
+        // 排空不完也无所谓，这是临时实例
         setTimeout(() => {
-          try {
-            if (child.exitCode === null) child.kill('SIGKILL')
-          } catch {}
+          if (child.exitCode === null) stopTemporary(child)
         }, 7000).unref?.()
         resolve(result)
       }

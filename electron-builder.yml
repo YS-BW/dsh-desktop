@@ -11,6 +11,18 @@
 # 换来的是「自带引擎能可靠启动」。
 asar: false
 
+# 关掉 electron-builder 的原生模块重建（@electron/rebuild）。
+#
+# 这是**架构决定**，不是为了绕过一个报错：
+#   1. 这个 App 里 **Electron 自己不加载任何原生模块** —— dsh 引擎跑在一个真实的
+#      node 子进程里（见 README「为什么必须带一个真正的 Node」）。把原生模块按
+#      Electron 的 ABI 重建，反而会让引擎在真 node 下加载失败：ABI 对不上。
+#   2. 没有 Python / VS Build Tools 的机器上，重建会让打包直接失败（实测 node-pty
+#      会走 node-gyp，报 "Could not find any Python installation to use"）。
+# 代价要说清楚：引擎里那些依赖预编译二进制的可选功能（例如终端的 node-pty）不会
+# 在打包阶段被构建 —— 它们由 dsh 自己的 plugin 命令在运行时处理。
+npmRebuild: false
+
 appId: com.dsh.desktopmin
 productName: DSH Desktop Min
 
@@ -21,6 +33,9 @@ directories:
 # 打包进 App 的内容：壳自己 + 自带引擎（node 运行时、@deepseek-ai/dsh 及其依赖）
 files:
   - main.js
+  # platform.js 是 main/updater/plugin-installer/watchdog 共同依赖的平台差异层。
+  # 漏了它 = 打包版启动即崩（require 找不到模块）。新增共享模块时记得一起加。
+  - platform.js
   - updater.js
   - plugin-installer.js
   - notify.js
@@ -30,7 +45,38 @@ files:
   # 漏了它 = 升级时窗口会切到一个不存在的文件 → 白屏。
   - splash.html
   - setup.html
+  # Windows 托盘图标：菜单栏收起后托盘是主要入口，运行时要从这里读图。
+  # （macOS 不做托盘，图标走 mac.icon 的 icns，不需要这个文件。）
+  - build/icon.png
   - package.json
+  # 引擎那一棵（@deepseek-ai/*）**交给下面的 extraResources 原样拷贝**，这里排除掉，
+  # 避免重复拷贝（也顺手绕开依赖收集器对它的裁剪）。
+  - "!node_modules/@deepseek-ai/**"
+
+# ── 引擎整棵原样拷贝 ─────────────────────────────────────────────────────
+#
+# 为什么不能靠 electron-builder 自动收集依赖（这是实测出来的真 bug）：
+#
+#   引擎的插件在 lockfile 里是 **peerDependencies**（`"peer": true`，而且没有任何
+#   条目把其中大多数声明为普通 dependencies）。npm 7+ 会把 peer 依赖自动装到顶层，
+#   所以 `npm start` 一切正常；而 electron-builder 的依赖收集器**只跟 dependencies**，
+#   于是实测有 24 个 @deepseek-ai/* 包没进安装包 —— 包括 dsh-app-boot 无条件 import 的
+#   `@deepseek-ai/cordis-plugin-group`。
+#
+#   后果极隐蔽：`release/win-unpacked` 放在仓库目录里时，Node 的模块解析会**向上回溯**
+#   命中仓库开发态的 node_modules，看起来一切正常；一旦装到程序目录（或 mac 的 DMG
+#   挂到 /Applications），这条退路没有了，应用直接起不来：
+#       Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/cordis-plugin-group'
+#   也就是说，只测 unpacked、不测安装版，是发现不了这个问题的。
+#
+# 所以这里不走收集器：引擎整棵原样进包。这也和本项目的架构一致 —— 引擎是用
+# **自带的真 node** 跑的独立 Node 应用（见 README「为什么必须带一个真正的 Node」），
+# 它按 Node 的常规解析规则找依赖，那棵树的完整性必须由我们保证。
+extraResources:
+  - from: node_modules/@deepseek-ai
+    to: app/node_modules/@deepseek-ai
+    filter:
+      - "**/*"
 
 # 这些不进包：诊断脚本、图标源文件（App 运行时用不到）
 extraMetadata:
@@ -62,6 +108,37 @@ dmg:
   title: DSH Desktop Min
   # 不做公证，保持简单
   sign: false
+
+# ── Windows ─────────────────────────────────────────────────────────────
+#
+# 为什么只出 nsis、不出 portable：
+#   Windows 的 toast 通知要求进程有 AppUserModelID，**并且系统里存在与之匹配的开始
+#   菜单快捷方式**。nsis 安装包会建这个快捷方式，portable / 直接解压运行的目录不会 ——
+#   那种情况下 `Notification.isSupported()` 照样返回 true，但投递会被系统静默丢弃。
+#   和 mac 那边「必须 ad-hoc 签名否则通知发不出来」是同一类约束，所以这里选安装版。
+#
+# 为什么用 1024×1024 的 png 而不是手写 .ico：
+#   electron-builder 会自己转出多尺寸 ico。build/icon.png 是现成的 1024 方图。
+#
+# 为什么 perMachine: false：
+#   每用户安装，不需要管理员权限 —— 而这正是原先卡住插件向导的那类环境
+#   （没有管理员、也没开开发者模式）。
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+
+nsis:
+  # 不用一键安装：给用户一个能选目录的正常安装向导
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  # 通知依赖它，不要关
+  createStartMenuShortcut: true
+  createDesktopShortcut: true
+  shortcutName: DSH Desktop Min
+  artifactName: ${productName}-${version}-setup.${ext}
 
 # 关掉自动更新：这个 App 的更新方式是「原生菜单栏从 npm 拉引擎」（见 README 的「引擎」一节），
 # 不是 electron-builder 的发布通道。

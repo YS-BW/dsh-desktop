@@ -2,13 +2,18 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
+const { PATH_KEY, envPath } = require('../platform')
 const {
   PLUGIN_CATALOG,
   commandForEngine,
   createPluginInstaller,
-  parsePnpmList
+  parsePnpmList,
+  resolvePnpmEntry
 } = require('../plugin-installer')
 
 test('parsePnpmList reads pnpm JSON and tolerates a log prefix', () => {
@@ -35,6 +40,22 @@ test('commandForEngine uses the selected engine without assuming a system dsh', 
     command: '/usr/local/bin/dsh',
     argv: ['plugin']
   })
+})
+
+test('resolvePnpmEntry picks whichever bin script this pnpm version ships', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-pnpm-test-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'bin'), { recursive: true })
+
+  // 什么都没装 → 明确返回 undefined（调用方据此打日志，而不是写一个跑不起来的入口）
+  assert.equal(resolvePnpmEntry(root), undefined)
+
+  fs.writeFileSync(path.join(root, 'bin', 'pnpm.cjs'), '')
+  assert.equal(resolvePnpmEntry(root), path.join(root, 'bin', 'pnpm.cjs'))
+
+  // 两个都在时优先 .mjs（corepack/ESM 那条，也是原实现用的那个）
+  fs.writeFileSync(path.join(root, 'bin', 'pnpm.mjs'), '')
+  assert.equal(resolvePnpmEntry(root), path.join(root, 'bin', 'pnpm.mjs'))
 })
 
 function fakeSpawner(responses, calls) {
@@ -82,7 +103,13 @@ test('change only installs curated packages and validates the public DSH profile
     ['--profile', 'web', '--dump-config']
   ])
   assert.equal(calls[0].options.env.DSH_HOME, '/tmp/home')
-  assert.match(calls[0].options.env.PATH, /^\/app\/node_modules\/\.bin:/)
+  // PATH 的键名和分隔符都按平台走：Windows 上是 `Path` + `;`，POSIX 上是 `PATH` + `:`。
+  // 这里以前写死了 POSIX 的 `:` 前缀，所以在 Windows 上必然失败 —— 是测试不可移植，
+  // 不是产品逻辑有问题（产品用的是 path.delimiter）。
+  const childPath = envPath(calls[0].options.env)
+  assert.equal(childPath.split(path.delimiter)[0], '/app/node_modules/.bin')
+  const pathKeys = Object.keys(calls[0].options.env).filter((key) => key.toUpperCase() === 'PATH')
+  assert.deepEqual(pathKeys, [PATH_KEY])
 })
 
 test('unknown plugin ids never reach DSH', async () => {

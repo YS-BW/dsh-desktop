@@ -9,10 +9,30 @@
  */
 
 const { spawn } = require('node:child_process')
+const fs = require('node:fs')
 const path = require('node:path')
+
+const { envPath, setEnvPath } = require('./platform')
 
 const PROFILE = 'web'
 const COMMAND_TIMEOUT_MS = 180_000
+
+/**
+ * pnpm 包里的入口脚本。
+ *
+ * 为什么要试多个名字:pnpm 的 npm 包里 bin 入口的文件名随版本变过(`pnpm.mjs`
+ * 是 corepack/ESM 那条,`pnpm.cjs` 是 package.json 的 `bin` 指向的那个),
+ * 而这里只需要"能拿 node 跑起来的那一个",所以按存在性挑,不写死。
+ */
+const PNPM_ENTRY_CANDIDATES = ['bin/pnpm.mjs', 'bin/pnpm.cjs']
+
+function resolvePnpmEntry(packageRoot) {
+  for (const relative of PNPM_ENTRY_CANDIDATES) {
+    const candidate = path.join(packageRoot, relative)
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return undefined
+}
 
 /**
  * 首版是固定白名单，页面传回的只是 id，不是任意 npm 包名。
@@ -107,9 +127,11 @@ function createPluginInstaller({
         return
       }
 
+      // PATH 的键名按平台语义写：Windows 上进程环境里通常是 `Path`，
+      // 直接 `env.PATH = ...` 会造出第二个键，子进程可能拿到旧值或者干脆丢掉 PATH。
       const env = { ...process.env, DSH_HOME: dshHome, NO_COLOR: '1' }
-      const pathParts = [...executableDirs.filter(Boolean), env.PATH || ''].filter(Boolean)
-      env.PATH = pathParts.join(path.delimiter)
+      const pathParts = [...executableDirs.filter(Boolean), envPath(env)].filter(Boolean)
+      setEnvPath(env, pathParts.join(path.delimiter))
 
       log('运行 DSH 插件命令:', command, argv.join(' '))
       let child
@@ -117,7 +139,9 @@ function createPluginInstaller({
         child = spawnImpl(command, argv, {
           cwd: workspace,
           env,
-          stdio: ['ignore', 'pipe', 'pipe']
+          stdio: ['ignore', 'pipe', 'pipe'],
+          // Windows:同上,不给这个标志会在 GUI 里弹出控制台窗口。
+          windowsHide: true
         })
       } catch (error) {
         resolve({ ok: false, error: String(error.message || error), stdout: '', stderr: '' })
@@ -277,7 +301,9 @@ function createPluginInstaller({
 
 module.exports = {
   PLUGIN_CATALOG,
+  PNPM_ENTRY_CANDIDATES,
   commandForEngine,
   createPluginInstaller,
-  parsePnpmList
+  parsePnpmList,
+  resolvePnpmEntry
 }

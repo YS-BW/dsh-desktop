@@ -14,16 +14,35 @@
  * 一个 hmr-fallback 插件。真 Node 没有这个问题，所以这里零插件。
  */
 
-const { app, BrowserWindow, shell, dialog, Menu, nativeTheme, Notification, session } = require('electron')
+const {
+  app,
+  BrowserWindow,
+  shell,
+  dialog,
+  Menu,
+  Tray,
+  nativeImage,
+  nativeTheme,
+  Notification,
+  session
+} = require('electron')
 const { spawn, execFileSync } = require('node:child_process')
+const { fileURLToPath } = require('node:url')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createRequire } = require('node:module')
 const { createUpdater } = require('./updater')
-const { PLUGIN_CATALOG, createPluginInstaller } = require('./plugin-installer')
+const { PLUGIN_CATALOG, createPluginInstaller, resolvePnpmEntry } = require('./plugin-installer')
 const { createTurnWatcher, formatDuration, summarize } = require('./notify')
 const { createLineReader, extractAuthenticatedUrl } = require('./output-lines')
+const {
+  ensureCommandEntry,
+  findExecutableIn,
+  isExecutableFile,
+  killProcessTree,
+  choosePort
+} = require('./platform')
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
@@ -82,8 +101,27 @@ const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
  * hmr-fallback 插件。真 Node 没这个问题，所以这里一个插件都不用。
  */
 function resolveEngine() {
+  const bundledNode = bundledNodePath()
+
+  /**
+   * 把「一个入口」配成可 spawn 的 { command, argv } 形态。
+   *
+   * 规则：**JS 入口必须用一个真正的 node 去加载**。dsh 的 shebang 是
+   * `#!/usr/bin/env node`，而 Windows 上 spawn 一个 `.js` 文件根本不会执行 ——
+   * 没有 shebang 机制，也没有执行位。所以：
+   *   · 有自带 node → `node <bin.js>`
+   *   · 没自带 node（只可能是开发态不完整）→ 借 Electron 自己的 Node
+   *     （ELECTRON_RUN_AS_NODE=1，见 backendEnv），并在日志里说清楚
+   */
+  const asEngine = (bin, source) => {
+    if (!/\.(?:c?js|mjs)$/i.test(bin)) return { node: undefined, bin, source }
+    if (bundledNode) return { node: bundledNode, bin, source }
+    log(`警告：找不到自带的 node，${source} 将借用 Electron 的 Node 运行`)
+    return { node: process.execPath, bin, source, useElectronNode: true }
+  }
+
   if (process.env.DSH_MIN_BIN) {
-    return { node: undefined, bin: process.env.DSH_MIN_BIN, source: 'DSH_MIN_BIN' }
+    return asEngine(process.env.DSH_MIN_BIN, 'DSH_MIN_BIN')
   }
 
   // 1. `current` 指针指向的已升级引擎（engines/<版本>/）
@@ -95,27 +133,40 @@ function resolveEngine() {
   const version = engine?.currentVersion()
   if (version) {
     const bin = engine.engineBinPath(engine.engineDir(version))
-    const node = bundledNodePath()
-    if (node && fs.existsSync(bin)) {
-      return { node, bin, source: `已升级引擎 ${version}` }
+    if (bundledNode && fs.existsSync(bin)) {
+      return { node: bundledNode, bin, source: `已升级引擎 ${version}` }
     }
   }
 
   // 2. 自带引擎
   const bundledBin = bundledDshEntry()
-  const bundledNode = bundledNodePath()
   if (bundledBin && bundledNode) {
     return { node: bundledNode, bin: bundledBin, source: `自带引擎 ${engineVersion(bundledBin)}` }
   }
 
   // 3-4. 开发态 / 兜底：系统里的 dsh
+  //
+  // 优先找「npm 包里的 lib/bin.js」这一种形态：Windows 上 PATH 里的 `dsh` 是 `dsh.cmd`，
+  // spawn 它必须开 `shell: true`（Node 20.12+ 修掉 .cmd/.bat 的注入面之后就是这样），
+  // 而把参数交给 cmd.exe 重新拼一遍是我们不想引入的注入面。
+  // 直接找包入口、用自带 node 加载，既不需要 shell 也不会踩引号转义。
   for (const location of standardDshLocations()) {
-    if (isExecutable(location)) return { node: undefined, bin: location, source: '系统 dsh' }
+    if (isExecutableFile(location) || fs.existsSync(location)) {
+      return asEngine(location, '系统 dsh')
+    }
   }
-  const fromPath = findExecutableIn(process.env.PATH || '', 'dsh')
-  if (fromPath) return { node: undefined, bin: fromPath, source: 'PATH 上的 dsh' }
-  const fromShell = findExecutableIn(loginShellPath() || '', 'dsh')
-  if (fromShell) return { node: undefined, bin: fromShell, source: '登录 shell 里的 dsh' }
+
+  // POSIX 上再兜最后一层：「PATH / 登录 shell 里的 dsh 命令」。
+  //
+  // 这一层是给版本管理器（volta / nodenv / bun）的用户留的 —— 它们的 shim 在 POSIX 上
+  // 是可执行文件，直接 spawn 就行，所以原来就有这条路，不能因为 Windows 的约束把它砍掉。
+  // Windows 上刻意不走这里：那边 shim 是 .cmd，理由见上。
+  if (process.platform !== 'win32') {
+    const fromPath = findExecutableIn(process.env.PATH || '', 'dsh')
+    if (fromPath) return asEngine(fromPath, 'PATH 上的 dsh')
+    const fromShell = findExecutableIn(loginShellPath() || '', 'dsh')
+    if (fromShell) return asEngine(fromShell, '登录 shell 里的 dsh')
+  }
 
   return undefined
 }
@@ -160,50 +211,73 @@ function bundledDshEntry() {
 }
 
 /**
- * npm 全局安装 dsh 后，可执行文件最可能出现的位置。
+ * 系统里（npm 全局 / 版本管理器）装着 dsh 时，它的**包入口**最可能出现的位置。
  *
- * npm 的全局 bin 目录随 prefix 变化，常见形态有：
- *   /usr/local/bin、/opt/homebrew/bin      —— Homebrew 的 node
- *   ~/.npm-global/bin、~/.local/bin        —— 常见的用户级 prefix
- *   ~/.nvm/versions/node/<版本>/bin        —— nvm
- *   ~/.volta/bin                           —— volta
- * 另外也直接找包目录，跳过可能缺失的 shim。
+ * 为什么一律指向 `@deepseek-ai/dsh/lib/bin.js`，而不是 `dsh` 这个命令本身：
+ *   · POSIX 上那个 shim 是符号链接，直接找包入口可以跳过它；
+ *   · Windows 上那个 shim 是 `dsh.cmd`，spawn 它必须开 `shell: true`
+ *     （Node 20.12+ 修掉 .cmd/.bat 的注入面之后就是这样），而把参数交给 cmd.exe
+ *     重新拼一遍是我们不想引入的注入面。
+ * 直接找包入口、用自带 node 加载，两种平台一条路径走通，也不需要 shell。
+ *
+ * 两种平台的目录约定差得很远，所以这里明确分支，不做「猜」。
  */
 function standardDshLocations() {
   const home = os.homedir()
-  const binDirs = [
-    '/usr/local/bin',
-    '/opt/homebrew/bin',
-    path.join(home, '.npm-global', 'bin'),
-    path.join(home, '.local', 'bin'),
-    path.join(home, '.volta', 'bin'),
-    path.join(home, '.bun', 'bin'),
-    path.join(home, '.nodenv', 'shims')
-  ]
+  const moduleRoots = []
+  const shimLocations = []
 
-  // nvm：每个已安装版本一个 bin 目录
-  try {
-    const nvmVersions = path.join(home, '.nvm', 'versions', 'node')
-    for (const version of fs.readdirSync(nvmVersions)) {
-      binDirs.push(path.join(nvmVersions, version, 'bin'))
+  if (process.platform === 'win32') {
+    // npm 的全局 prefix 默认在 %APPDATA%\npm；pnpm 的全局目录在 %LOCALAPPDATA%\pnpm；
+    // Volta 在 %LOCALAPPDATA%\Volta；官方 node 安装包的全局 prefix 在 Program Files\nodejs。
+    const bases = [
+      process.env.APPDATA && path.join(process.env.APPDATA, 'npm'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'pnpm'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Volta'),
+      process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'nodejs')
+    ]
+    for (const base of bases) {
+      if (base) moduleRoots.push(path.join(base, 'node_modules'))
     }
-  } catch {}
+  } else {
+    const binDirs = [
+      '/usr/local/bin',
+      '/opt/homebrew/bin',
+      path.join(home, '.npm-global', 'bin'),
+      path.join(home, '.local', 'bin'),
+      path.join(home, '.volta', 'bin'),
+      path.join(home, '.bun', 'bin'),
+      path.join(home, '.nodenv', 'shims')
+    ]
+    // bin 目录同级往上找 lib/node_modules —— npm 全局包的落点
+    for (const dir of binDirs) moduleRoots.push(path.join(dir, '..', 'lib', 'node_modules'))
+
+    // nvm：每个已安装版本一个 node_modules
+    try {
+      const nvmVersions = path.join(home, '.nvm', 'versions', 'node')
+      for (const version of fs.readdirSync(nvmVersions)) {
+        moduleRoots.push(path.join(nvmVersions, version, 'lib', 'node_modules'))
+      }
+    } catch {}
+
+    moduleRoots.push(
+      '/usr/local/lib/node_modules',
+      '/opt/homebrew/lib/node_modules',
+      path.join(home, '.npm-global', 'lib', 'node_modules'),
+      path.join(home, '.local', 'lib', 'node_modules')
+    )
+
+    // 另一类候选：版本管理器的 shim 本身（POSIX 上是可执行文件，可以直接 spawn）。
+    // 这一路是原有能力，保留 —— 有些安装（volta / nodenv / bun）只暴露 shim，
+    // 包目录并不在标准 node_modules 位置上。
+    for (const dir of binDirs) shimLocations.push(path.join(dir, 'dsh'))
+  }
 
   const locations = []
-  for (const dir of binDirs) locations.push(path.join(dir, 'dsh'))
-
-  // 直接指向包入口，跳过 shim
-  const moduleRoots = [
-    '/usr/local/lib/node_modules',
-    '/opt/homebrew/lib/node_modules',
-    path.join(home, '.npm-global', 'lib', 'node_modules'),
-    path.join(home, '.local', 'lib', 'node_modules')
-  ]
   for (const root of moduleRoots) {
     locations.push(path.join(root, '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
   }
-
-  return locations
+  return [...locations, ...shimLocations]
 }
 
 /**
@@ -215,18 +289,26 @@ function standardDshLocations() {
  *
  * 所以这里在必要时把登录 shell 的 PATH 并进来 —— 仍属兜底，只在 PATH 看起来
  * 「不像用户环境」时才去问 shell。
+ *
+ * Windows 上没有这一层（见 needsShellPath 的说明）；另外：
+ *   · PATH 必须按平台语义写（`Path` / `PATH`），否则会造出两个键，子进程可能拿到旧值；
+ *   · 借用 Electron 的 Node 跑 JS 入口时，要显式打开 ELECTRON_RUN_AS_NODE。
  */
-function backendEnv() {
+function backendEnv(engine) {
   const env = { ...process.env, DSH_HOME, NO_COLOR: '1' }
+  if (engine?.useElectronNode) env.ELECTRON_RUN_AS_NODE = '1'
   if (needsShellPath()) {
     const fromShell = loginShellPath()
-    if (fromShell) env.PATH = fromShell
+    if (fromShell) setEnvPath(env, fromShell)
   }
   return env
 }
 
 /** 当前 PATH 像是从 Finder 启动的（不含用户级目录）时返回 true。 */
 function needsShellPath() {
+  // Windows 上没有对应问题：进程环境是从注册表展开的，从开始菜单/资源管理器启动
+  // 一样拿得到完整的用户 PATH，不存在 launchd 那种「最小 PATH」。
+  if (process.platform === 'win32') return false
   const current = process.env.PATH || ''
   if (!current.includes('/usr/bin')) return false
   // 只要 PATH 里出现了典型的用户级目录，就认为是从终端启动的，不必再问 shell。
@@ -242,6 +324,8 @@ function needsShellPath() {
  */
 let cachedShellPath
 function loginShellPath() {
+  // 只有 POSIX 有「登录 shell 的 PATH」这个概念；Windows 上走注册表那套，见 needsShellPath。
+  if (process.platform === 'win32') return undefined
   if (cachedShellPath !== undefined) return cachedShellPath
 
   cachedShellPath = undefined
@@ -258,23 +342,8 @@ function loginShellPath() {
   return cachedShellPath
 }
 
-function findExecutableIn(searchPath, name) {
-  for (const dir of searchPath.split(path.delimiter)) {
-    if (!dir) continue
-    const candidate = path.join(dir, name)
-    if (isExecutable(candidate)) return candidate
-  }
-  return undefined
-}
-
-function isExecutable(candidate) {
-  try {
-    fs.accessSync(candidate, fs.constants.X_OK)
-    return true
-  } catch {
-    return false
-  }
-}
+// 找命令、判断可执行这两件事已经移到 platform.js（Windows 上必须按 PATHEXT 判，
+// 而不是 POSIX 的 X_OK 位），这里不再保留本地实现。
 
 
 // ── 应用设置（菜单里改的那些偏好）─────────────────────────────────────────
@@ -433,8 +502,16 @@ function pluginInstaller() {
 
 /**
  * electron-builder 会打包 pnpm 的 CLI，但会丢掉 `node_modules/.bin/pnpm` 链接。
- * DSH 的公开 plugin 命令通过 PATH 执行 `pnpm`，因此在 App 外的可写目录
- * 建一条绝对路径链接。App 更新后目标路径变了，下次使用时会原子替换。
+ * DSH 的公开 plugin 命令通过 PATH 执行 `pnpm`，因此在 App 外的可写目录里准备一个
+ * 入口，然后把那个目录塞进 PATH。
+ *
+ * 平台差异（这里踩过坑，都是实测结论）：
+ *   · **Windows 不能建符号链接** —— 那需要管理员权限或开发者模式，普通机器会直接报
+ *     「此操作需要管理员权限」，于是向导里勾任何插件都会失败（`dsh plugin` 找不到
+ *     pnpm）。所以 Windows 上写一个 `pnpm.cmd`，内容是 `"<自带的 node>" "<pnpm 入口>" %*`；
+ *     写普通文件不需要任何特权。
+ *   · Windows 上命令必须是带 PATHEXT 后缀的真实文件，`pnpm` 这个名字本身不是命令。
+ * App 更新后目标路径变了，下次使用时会原子替换。
  */
 function ensurePluginPnpmDir() {
   try {
@@ -442,20 +519,22 @@ function ensurePluginPnpmDir() {
     // pnpm 只导出包根，而根入口正好就是 package.json。
     // 不能 resolve `pnpm/package.json`，那会被 package exports 拒绝。
     const manifest = require.resolve('pnpm')
-    const target = path.join(path.dirname(manifest), 'bin', 'pnpm.mjs')
-    if (!fs.existsSync(target)) return undefined
+    const scriptPath = resolvePnpmEntry(path.dirname(manifest))
+    if (!scriptPath) {
+      log('准备自带 pnpm 失败:在 pnpm 包里找不到入口脚本')
+      return undefined
+    }
+
+    const nodePath = bundledNodePath()
+    if (process.platform === 'win32' && !nodePath) {
+      // shim 必须由一个真实 node 来执行脚本；借 Electron 内置 Node 会踩回
+      // utility process 那条老路（见文件头关于 --expose-internals 的说明）。
+      log('准备自带 pnpm 失败:找不到自带的 node，无法生成 Windows 命令 shim')
+      return undefined
+    }
 
     const binDir = path.join(DESKTOP_HOME, 'bin')
-    const command = path.join(binDir, 'pnpm')
-    fs.mkdirSync(binDir, { recursive: true })
-    try {
-      if (fs.realpathSync(command) === fs.realpathSync(target)) return binDir
-    } catch {}
-
-    const temp = `${command}.tmp-${process.pid}`
-    fs.rmSync(temp, { force: true })
-    fs.symlinkSync(target, temp)
-    fs.renameSync(temp, command)
+    ensureCommandEntry({ binDir, name: 'pnpm', scriptPath, nodePath })
     return binDir
   } catch (error) {
     log('准备自带 pnpm 失败:', String(error?.message || error))
@@ -478,7 +557,12 @@ function startWatchdog(backendPid) {
       process.execPath,
       [path.join(__dirname, 'watchdog.js'), String(process.pid), String(backendPid)],
       // detached + unref：让看门狗独立于壳的进程组，壳被整组杀掉时它也能活下来。
-      { detached: true, stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } }
+      {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+      }
     )
     watcher.unref()
     log(`看门狗已启动 (backend pid=${backendPid})`)
@@ -498,6 +582,27 @@ function startWatchdog(backendPid) {
 const stripAnsi = (s) => s.replace(/\u001B\[[0-9;]*m/g, '')
 
 const BACKEND_START_TIMEOUT_MS = 45_000
+
+/**
+ * 首选后端端口。
+ *
+ * 为什么不再用 `--port 0` 每次随机：dsh 的浏览器会话 cookie 名是
+ * `dsh-auth-<sha256(host:port)>` —— **端口进了名字**。随机端口意味着每次启动都在
+ * `127.0.0.1` 这个域下留一条新 cookie，而没有任何人会去删旧的；攒到 64 条约 3.4KB 时，
+ * 叠加客户端模块那条超长的 `/plugins/??…` 合并 URL，整个请求头会顶穿 Node 默认的
+ * 16KB 上限，服务端回 **HTTP 431**，页面表现成「插件全加载不出来」。
+ * 固定端口让 origin 稳定，从根上不再累积（原先靠 pruneAuthCookies 兜着，那个仍然保留）。
+ *
+ * 被占用就回落 0（让系统分配），所以不会和你在终端里跑的 dsh 抢端口；
+ * `DSH_MIN_PORT=0` 可以强制回到随机端口。
+ * 43140 是避开 DSH Desktop 自己占用的 43127~43129 之后随便挑的高位端口。
+ */
+const PREFERRED_BACKEND_PORT = Number(process.env.DSH_MIN_PORT ?? 43140)
+
+/** 选一个后端端口：优先固定端口，占用了就回落 0。探测失败也回落 0，绝不因此启动失败。 */
+function backendPort() {
+  return choosePort(PREFERRED_BACKEND_PORT)
+}
 
 /**
  * 启动当前选中的引擎，等它输出一整行带凭据的 URL 后才算成功。
@@ -558,8 +663,11 @@ function startBackend(port) {
     try {
       backend = spawn(command, argv, {
         cwd: WORKSPACE,
-        env: backendEnv(),
-        stdio: ['ignore', 'pipe', 'pipe']
+        env: backendEnv(engine),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Windows:后端是 node.exe(控制台程序),而壳是 GUI 进程。不给这个标志,
+        // Windows 会给它分配一个控制台窗口 —— 用户看到的是启动时凭空多一个黑窗。
+        windowsHide: true
       })
     } catch (error) {
       finish({ ok: false, error: String(error.message || error) })
@@ -630,9 +738,9 @@ function startBackend(port) {
       startupFailure =
         `等待 dsh 启动超时（${BACKEND_START_TIMEOUT_MS} ms）` +
         (recentOutput.trim() ? `：${recentOutput.trim().slice(-600)}` : '')
-      try {
-        backend.kill('SIGKILL')
-      } catch {
+      // 用进程树终止：卡住的后端往往已经派生了一堆子进程（工具调用、rg 等），
+      // 只杀它自己的 pid 会留下一片孤儿。
+      if (!killBackendProcess(backend)) {
         finish({ ok: false, error: startupFailure })
       }
     }, BACKEND_START_TIMEOUT_MS)
@@ -641,10 +749,17 @@ function startBackend(port) {
 }
 
 /**
- * 优雅停掉后端。
+ * 停掉后端。
  *
- * DSH 自己给了 5 秒排空宽限（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3`），所以这里等 7 秒
- * 再升级到 SIGKILL —— 卡在 4 秒会把排空砍断、留下半截会话日志。
+ * **POSIX**：dsh 自己给了 5 秒排空宽限（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5e3`，由
+ * `process.on('SIGTERM')` 驱动），所以这里等 7 秒再升级到 SIGKILL —— 卡在 4 秒会把
+ * 排空砍断、留下半截会话日志。
+ *
+ * **Windows**：没有"可送达的 SIGTERM"这回事 —— `child.kill('SIGTERM')` 在那边等价于
+ * `TerminateProcess`，dsh 那个信号处理器根本不会被调用，5 秒排空**必然不执行**。
+ * 所以那边不做「优雅」的假装，直接 `taskkill /t /f`，重点是 `/t`：dsh 会派生工具调用的
+ * 子进程（pwsh、rg 等），只杀它自己的 pid 会留下一堆活着的孙子进程占着工作目录。
+ * 真正的兜底不是这里，而是会话日志的追加式+原子写（dsh 自己用 MoveFileEx 保证）。
  */
 function stopBackend({ forceAfterMs = 7000 } = {}) {
   return new Promise((resolve) => {
@@ -653,16 +768,42 @@ function stopBackend({ forceAfterMs = 7000 } = {}) {
       resolve()
       return
     }
+    const target = child
+
     const force = setTimeout(() => {
-      if (child && child.exitCode === null) child.kill('SIGKILL')
+      if (target.exitCode === null) killBackendProcess(target)
     }, forceAfterMs)
-    child.once('exit', () => {
+
+    target.once('exit', () => {
       clearTimeout(force)
-      child = undefined
+      if (child === target) child = undefined
       resolve()
     })
-    child.kill('SIGTERM')
+
+    if (!killBackendProcess(target, 'SIGTERM')) {
+      // 连信号都发不出去（进程已经没了之类的）：直接当作已结束，别把退出流程挂死
+      clearTimeout(force)
+      if (child === target) child = undefined
+      resolve()
+    }
   })
+}
+
+/**
+ * 结束一个后端进程，**连同它在 Windows 上派生的子孙进程**。
+ *
+ * @returns 是否成功发起了终止动作（false 表示进程已经不存在了）
+ */
+function killBackendProcess(target, signal = 'SIGKILL') {
+  if (!target || target.pid === undefined || target.exitCode !== null) return false
+  // Windows：taskkill /t /f 一把收完。POSIX：保持原来的信号语义。
+  if (process.platform === 'win32' && killProcessTree(target.pid, { force: true })) return true
+  try {
+    target.kill(signal)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** 用当前引擎重新拉起后端，并让窗口重新加载。 */
@@ -687,7 +828,7 @@ async function restartBackend({
   try {
     await stopBackend()
     baseUrl = undefined
-    started = await startBackend(0)
+    started = await startBackend(await backendPort())
     if (started.ok) return started
 
     switchError = started.error
@@ -705,7 +846,7 @@ async function restartBackend({
           steps: []
         })
         baseUrl = undefined
-        const restored = await startBackend(0)
+        const restored = await startBackend(await backendPort())
         if (restored.ok) {
           log(`启动失败，已恢复原状态: ${switchError}`)
           void dialog.showMessageBox({
@@ -1072,7 +1213,11 @@ async function testNotificationPermission() {
       message: '通知可用',
       detail:
         '测试通知已投递。\n\n' +
-        '如果屏幕上没看到，检查「系统设置 → 通知 → DSH Desktop Min」是否被设为「无」或开了「专注模式」。',
+        (process.platform === 'win32'
+          ? '如果屏幕上没看到，检查「设置 → 系统 → 通知」里 DSH Desktop Min 是否被关掉，' +
+            '以及是否开了「专注助手」。另外：Windows 的通知要求 App 有开始菜单快捷方式，' +
+            '所以要用安装版（NSIS）验证，portable / 未安装时可能收不到。'
+          : '如果屏幕上没看到，检查「系统设置 → 通知 → DSH Desktop Min」是否被设为「无」或开了「专注模式」。'),
       buttons: ['好']
     })
     return
@@ -1080,19 +1225,28 @@ async function testNotificationPermission() {
 
   // 失败：区分开发态和打包态，给出可执行的下一步
   const inDev = !app.isPackaged
+  const guidance = process.platform === 'win32'
+    ? inDev
+      ? '当前是开发态运行（npm start）。开发态的 Electron 没有开始菜单快捷方式和\n' +
+        'AppUserModelID 登记，Windows 通常会直接丢弃 toast —— 这是预期行为，\n' +
+        '用安装后的版本（NSIS）测才能验证。'
+      : '请检查：\n' +
+        '1. 设置 → 系统 → 通知 → DSH Desktop Min 是否允许\n' +
+        '2. 是否开了「专注助手」/ 勿扰\n' +
+        '3. 是否用的是安装版（portable 包没有开始菜单快捷方式，Windows 不认）'
+    : inDev
+      ? '当前是开发态运行（npm start）。开发态的 Electron 没有 app bundle 授权，' +
+        '系统会拒绝通知并报 UNErrorDomain 错误 1 —— 这是预期行为，' +
+        '用打包后的 .app 测才能验证。'
+      : '请检查：\n' +
+        '1. 系统设置 → 通知 → DSH Desktop Min 是否允许\n' +
+        '2. 是否开了专注模式 / 勿扰\n' +
+        '3. App 是否被移动过位置（移动后需要重新打开一次让系统重新登记）'
+
   dialog.showMessageBox({
     type: 'warning',
     message: '通知投递失败',
-    detail:
-      `结果：${outcome}\n\n` +
-      (inDev
-        ? '当前是开发态运行（npm start）。开发态的 Electron 没有 app bundle 授权，' +
-          '系统会拒绝通知并报 UNErrorDomain 错误 1 —— 这是预期行为，' +
-          '用打包后的 .app 测才能验证。'
-        : '请检查：\n' +
-          '1. 系统设置 → 通知 → DSH Desktop Min 是否允许\n' +
-          '2. 是否开了专注模式 / 勿扰\n' +
-          '3. App 是否被移动过位置（移动后需要重新打开一次让系统重新登记）'),
+    detail: `结果：${outcome}\n\n${guidance}`,
     buttons: ['好']
   })
 }
@@ -1337,11 +1491,29 @@ function markSetupComplete() {
   }
 }
 
+/**
+ * 当前页是不是 App 自带的初始化页。
+ *
+ * 它同时是两处的门禁：`pushSetupState`（往页面推插件清单）和 `handleSetupIntent`
+ * （处理「跳过 / 安装已选并继续」）。所以这个判断一旦出错，症状是**列表空白 + 按钮
+ * 全都没反应** —— 用户直接卡在向导里出不来。
+ *
+ * 为什么不能直接比字符串（这里踩过真坑）：Windows 上 `file:` URL 的 pathname 形如
+ * `/C:/Users/…`（正斜杠、带前导斜杠），而 `path.join` 给的是 `C:\Users\…`（反斜杠），
+ * 于是**永远不相等**。必须两边都过一遍 `fileURLToPath` 再比，它同时解决正/反斜杠、
+ * 前导斜杠、以及路径里的空格（打包后路径含 `DSH Desktop Min`，URL 里是 `%20`）。
+ */
 function isSetupPage() {
   if (!win || win.isDestroyed()) return false
   try {
     const current = new URL(win.webContents.getURL())
-    return current.protocol === 'file:' && decodeURIComponent(current.pathname) === SETUP_FILE
+    if (current.protocol !== 'file:') return false
+    const currentPath = path.resolve(fileURLToPath(current))
+    const expected = path.resolve(SETUP_FILE)
+    // Windows 的路径大小写不敏感（盘符大小写尤其不固定）
+    return process.platform === 'win32'
+      ? currentPath.toLowerCase() === expected.toLowerCase()
+      : currentPath === expected
   } catch {
     return false
   }
@@ -1373,6 +1545,10 @@ async function showSetup() {
   try {
     await win.loadFile(SETUP_FILE)
     pushSetupState({ plugins: setupCatalogForPage(), busy: false, message: '' })
+    // 这一行是刻意留的：初始化页出问题时（列表空白 / 按钮没反应）用户只会说
+    // 「这里没有内容，而且跳不过去」，而成功推送状态原本是完全静默的 ——
+    // 有这行就能一眼分清「状态没推过去」还是「推过去了但点击没被接住」。
+    log(`初始化页已就绪（${PLUGIN_CATALOG.length} 个可选插件，等待用户选择）`)
   } catch (error) {
     log('初始化页加载失败:', String(error?.message || error))
   }
@@ -1400,6 +1576,9 @@ async function handleSetupIntent(url) {
   const requested = (intent.searchParams.get('plugins') || '').split(',').filter(Boolean)
   const selected = [...new Set(requested)]
   if (selected.some((id) => !PLUGIN_CATALOG.some((plugin) => plugin.id === id))) return
+
+  // 同上：记下意图，否则「按钮点了没反应」永远只能靠猜
+  log(`初始化页收到意图：${intent.hostname}（选中 ${selected.length} 个插件）`)
 
   setupBusy = true
   const transactions = []
@@ -1462,6 +1641,83 @@ async function handleSetupIntent(url) {
  */
 const TRAFFIC_LIGHT_PAD_TOP = process.env.DSH_MIN_TOP_PAD || '30'
 
+/**
+ * Windows：把原生标题栏也去掉，只留系统画的三个窗口按钮。
+ *
+ * 做法与社区版 DSH Desktop 一致（`titleBarStyle:'hidden'` + `titleBarOverlay`，
+ * 底板全透明 → 系统只画三个字符，那条地归应用，于是没有系统灰底横条）。
+ *
+ * 两条踩过的坑，写在这里避免以后重复调试：
+ *
+ *   1. **不要调 `win.setMenuBarVisibility(false)`。** 实测它与 `autoHideMenuBar: true`
+ *      同时用时，overlay 画的窗口按钮会整个消失（多次测量像素数为 0）。菜单栏收起这件事
+ *      `autoHideMenuBar` 一个人就能干（按 Alt 唤出），不需要那句额外的调用。
+ *      （作者本人实机确认过：只留这三个按钮的观感是好的，所以这条配置就这么定下来。）
+ *   2. **不要靠屏幕截图数像素来判断按钮在不在** —— 截图受窗口层级、坐标、DPI 影响，
+ *      在这个窗口上多次给出互相矛盾的结论。可靠办法是给窗口发 `WM_NCHITTEST`：
+ *      命中关闭/最大化/最小化会分别返回 HTCLOSE(20)/HTMAXBUTTON(9)/HTMINBUTTON(8)。
+ */
+const WINDOWS_TITLEBAR_HEIGHT = 36
+
+/**
+ * Windows 系统按钮的宽度兜底值。
+ * 优先用 Chromium 的 `env(titlebar-area-*)` 现算（跟着全屏/DPI/语言方向自动变），
+ * 拿不到时才回落到这个常量；140 也是 DSH Desktop 用的值。
+ */
+const WINDOWS_CAPTION_FALLBACK_WIDTH = 140
+
+/**
+ * 系统按钮的就地样式。`color: '#00000000'`（全透明底板）是「融入」的关键；
+ * symbolColor 跟随深浅色，否则深色主题下按钮看不见。
+ */
+function windowsTitleBarOverlay(isDark) {
+  return {
+    color: '#00000000',
+    symbolColor: isDark ? '#f3f4f6' : '#202124',
+    height: WINDOWS_TITLEBAR_HEIGHT
+  }
+}
+
+/**
+ * 把窗口底色与系统按钮样式对齐到当前主题。
+ * 只跟随系统主题（nativeTheme）；dsh 界面内部自己切主题不会同步 ——
+ * 那需要从渲染进程读主题再回传，而我们刻意不给页面开 IPC（见 pushSplash 的说明）。
+ */
+function applyWindowChromeTheme(target) {
+  if (!target || target.isDestroyed()) return
+  const isDark = nativeTheme.shouldUseDarkColors
+  try {
+    target.setBackgroundColor(isDark ? '#171513' : '#ffffff')
+    if (process.platform === 'win32') target.setTitleBarOverlay(windowsTitleBarOverlay(isDark))
+  } catch (error) {
+    log('同步窗口外观失败:', String(error?.message || error))
+  }
+}
+
+/**
+ * 原生标题栏被隐藏之后，Windows 上要补两件事。
+ *
+ * 1. **给 dsh 的会话顶栏让出右侧空间**：系统按钮浮在内容右上角（约 140px），
+ *    而 dsh 恰好把 ⋯ / 面板开关放在那儿，不让开就会被盖住、点不到。
+ *    选择器用上游的**语义锚点** `data-slot`（实测这份 dsh 里有 21 个），不是哈希类名。
+ * 2. **交互元素排除拖拽**：拖拽条横跨整条顶栏，按钮/输入框必须能点到。
+ */
+function windowsChromeCss() {
+  const caption = `calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - ${WINDOWS_CAPTION_FALLBACK_WIDTH}px)))`
+  return `
+  /* 会话顶栏：右侧避开系统按钮（+8px 视觉间隙） */
+  [data-slot="conversation.session.header"] > header,
+  header[data-slot="conversation.session.header"] {
+    padding-right: calc(${caption} + 8px) !important;
+  }
+
+  /* 顶栏里的交互元素不参与拖拽 */
+  button, a, input, select, textarea, [role="button"] {
+    -webkit-app-region: no-drag !important;
+  }
+`
+}
+
 const TRAFFIC_LIGHT_CSS = `
   /* ── 1. 给红绿灯让出顶部空间 ─────────────────────────────────
      dsh 侧栏从窗口左上角 (0,0) 开始、logo 行只有 6px 上边距，品牌标落在 (16,27)，
@@ -1475,21 +1731,40 @@ const TRAFFIC_LIGHT_CSS = `
 /**
  * 注入一条透明拖拽条，恢复原生窗口拖拽手势。
  *
- * 为什么需要：frameless + titleBarStyle:'hidden' 下 Chromium 不会给内容区自动拖拽能力
- * —— 实测裸窗口里所有元素的 -webkit-app-region 都是 none，dsh 自己也不设置，所以窗口
- * 完全拖不动。而 dsh 的 UI 铺满窗口，没有现成的空白标题栏可用。
+ * 两个平台都要：系统标题栏都没了，Chromium 不会给内容区自动拖拽能力
+ * （实测裸窗口里所有元素的 `-webkit-app-region` 都是 none，dsh 自己也不设置）。
+ * 几何按平台分开，因为「系统占了哪块地方」不同：
  *
- * 做法（照搬社区版 DSH Desktop 验证过的模式）：用 executeJavaScript 在页面里建一个
- * 透明 div，设 -webkit-app-region: drag，贴在最顶部。
- *   · top 0 / height 24   → 正好落在红绿灯那一行的纵向范围内，不压到任何内容
- *   · left 80             → 避开 macOS 红绿灯（它们横向约占 10~72）
- *   · right 按窗口宽度算   → 避开右侧的头部按钮；窄窗口时自动收窄，不留 0 宽元素
- *   · z-index 18          → 浮在内容之上
+ *   macOS：红绿灯在**左上**（横向约占 x≈10~72）
+ *     → left 80 / height 24 / 右侧留 120 给头部按钮，pointer-events: auto。
  *
- * 只提供「抓取」区域，本身完全透明，不影响任何观感。
+ *   Windows：窗口按钮在**右上**（约占最右 140px，由 titleBarOverlay 浮在内容上）
+ *     → 从最左铺到 `right: captionWidth`，height 36（与系统按钮同高）。
+ *       必须 `pointer-events: none`：拖拽条横跨整条顶栏，而 dsh 的侧栏品牌标就在这条
+ *       带子里（实测 y≈6~66），不穿透的话那个按钮就点不到了。
+ *       宽度用 `env(titlebar-area-*)` 现算 —— 全屏时没有系统按钮，它会自动变成 0。
  */
 function installDragRegion(target) {
-  if (process.platform !== 'darwin') return
+  const isMac = process.platform === 'darwin'
+  const isWindows = process.platform === 'win32'
+  if (!isMac && !isWindows) return
+  const geometry = isMac
+    ? `{
+        el.style.left = '80px'
+        el.style.right = 'auto'
+        const width = window.innerWidth - 80 - 120   // 右侧留 120px 给头部按钮
+        el.style.width = Math.max(0, width) + 'px'
+        el.style.display = width > 40 ? 'block' : 'none'
+      }`
+    : `{
+        el.style.left = '0'
+        // 让开系统按钮那一块；全屏时 env 会给出 0，自动铺满
+        el.style.right =
+          'calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - ${WINDOWS_CAPTION_FALLBACK_WIDTH}px)))'
+        el.style.width = 'auto'
+        el.style.display = 'block'
+      }`
+
   target.webContents
     .executeJavaScript(
       `(() => {
@@ -1503,22 +1778,16 @@ function installDragRegion(target) {
             Object.assign(el.style, {
               position: 'fixed',
               top: '0',
-              height: '24px',
+              height: '${isMac ? 24 : WINDOWS_TITLEBAR_HEIGHT}px',
               background: 'transparent',
-              pointerEvents: 'auto',
+              // macOS 靠几何避让；Windows 必须穿透，否则会吃掉底下按钮的点击
+              pointerEvents: '${isMac ? 'auto' : 'none'}',
               userSelect: 'none'
             })
             el.style.setProperty('-webkit-app-region', 'drag')
             document.body.appendChild(el)
           }
-          // 右侧至少留出 120px 给头部按钮；窗口太窄就整体不启用。
-          const reserved = 120
-          const left = 80
-          const width = window.innerWidth - left - reserved
-          el.style.left = left + 'px'
-          el.style.right = 'auto'
-          el.style.width = Math.max(0, width) + 'px'
-          el.style.display = width > 40 ? 'block' : 'none'
+          ${geometry}
         }
         place()
         window.addEventListener('resize', place)
@@ -1538,10 +1807,16 @@ function createWindow() {
     minHeight: 520,
     show: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#171513' : '#ffffff',
-    // macOS：隐藏标题栏但保留红绿灯，窗口内容延伸到顶部。
-    // 这就是「自然融入」的来源；Windows/Linux 保持普通边框。
+    // 两个平台都把系统标题栏去掉，让内容延伸到窗口顶部；
+    // Windows 再用 titleBarOverlay 把三个窗口按钮「浮」回内容右上角（底板全透明）。
+    // 系统只画那三个字符，其余那条地归应用 —— 这就是没有系统灰底横条的来源。
+    // macOS 不需要 overlay：那边红绿灯本来就浮在内容上。
     frame: !isMac,
-    ...(isMac ? { titleBarStyle: 'hidden' } : {}),
+    titleBarStyle: 'hidden',
+    ...(isMac ? {} : { titleBarOverlay: windowsTitleBarOverlay(nativeTheme.shouldUseDarkColors) }),
+    // Windows：菜单栏默认收起，按 Alt 才唤出。
+    // 只靠 `autoHideMenuBar` —— **不要**再调 `setMenuBarVisibility(false)`（见上方注释第 1 条）。
+    ...(isMac ? {} : { autoHideMenuBar: true }),
     webPreferences: {
       // 加载的是远端(loopback)页面，必须保持隔离，不给 Node 能力。
       nodeIntegration: false,
@@ -1551,6 +1826,26 @@ function createWindow() {
   })
 
   win.once('ready-to-show', () => win.show())
+
+  // ⚠️ 这里**刻意不调** `win.setMenuBarVisibility(false)`（同时也去掉了 Windows 自绘标题栏）。
+  //
+  // 实测（Electron 44 + Windows 11 26100）：`autoHideMenuBar: true` 与
+  // `setMenuBarVisibility(false)` 同时使用时，`titleBarOverlay` 画的窗口按钮会**整个消失**
+  // —— 表现为窗口没有最小化/关闭按钮，只能 Alt+F4。四个变体的像素计数：
+  //     只 autoHideMenuBar                → 按钮在
+  //     只 setMenuBarVisibility(false)    → 按钮在
+  //     两个一起用                         → 按钮 0 个像素（消失）
+  // 而「先收起菜单栏、再补一次 setTitleBarOverlay」这种补救时灵时不灵（同一配置两次分别测到
+  // 有/无），是竞态、不可依赖。
+  //
+  // 所以这里只留 `autoHideMenuBar: true`：菜单栏照样默认收起（按 Alt 唤出），
+  // 而且重建菜单也不会让它冒出来 —— 这个选项本身管的就是这件事，不需要那句多余的调用。
+  // 社区版 DSH Desktop 那句 setMenuBarVisibility(false) 之所以没坏事，是因为它随后还会在
+  // 主题同步路径里重设 overlay；我们没有那条路径（刻意不开 IPC），就不去踩这个坑。
+
+  // 系统主题变了要重新对齐窗口底色与系统按钮符号色，否则深色下按钮看不见。
+  // （dsh 界面内部自己切主题不会走到这里，那条路需要渲染进程回传，我们没有开 IPC。）
+  nativeTheme.on('updated', () => applyWindowChromeTheme(win))
 
   // 外链交给系统浏览器，窗口内不开新窗口。
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -1577,7 +1872,11 @@ function createWindow() {
 
   // 等 DOM 就绪后再注入，避免样式被后续渲染覆盖。
   win.webContents.on('did-finish-load', () => {
-    win.webContents.insertCSS(TRAFFIC_LIGHT_CSS).catch(() => {})
+    // 两套平台专属样式，各自只管自己的平台：
+    //   macOS   —— 侧栏顶部给红绿灯让位（否则品牌标压在按钮下面）
+    //   Windows —— 会话顶栏右侧给系统按钮让位 + 交互元素排除拖拽
+    if (isMac) win.webContents.insertCSS(TRAFFIC_LIGHT_CSS).catch(() => {})
+    else win.webContents.insertCSS(windowsChromeCss()).catch(() => {})
     installDragRegion(win)
   })
 
@@ -1614,6 +1913,25 @@ function createWindow() {
       log(`  [net] ERROR ${details.error} ${details.url.slice(0, 90)}…`)
     })
   }
+
+  // ── 关窗 ≠ 退出：Windows 上收进托盘 ──────────────────────────────────
+  //
+  // 关掉窗口就把整个应用带走，会连带打断正在跑的长任务 —— 而桌面端留在后台本来就是
+  // 用户预期（macOS 的系统习惯也是如此：关窗不退出应用）。
+  //
+  // **只有在托盘确实建起来之后才这么做**：Windows 上没有托盘图标就藏起来，等于把应用
+  // 变成「人间蒸发」，只能在任务管理器里找。托盘没建起来（图标读取失败等）时保持
+  // 「关窗即退出」的老行为，绝不把用户困住。
+  //
+  // 真正的退出路径有两条，都仍然有效：托盘菜单「退出」、以及任何 app.quit()
+  // （`before-quit` 会先置 `quitting`，这里据此放行）。
+  win.on('close', (event) => {
+    if (quitting) return
+    if (process.platform !== 'win32' || !tray) return
+    event.preventDefault()
+    win.hide()
+    hintBackgroundOnce()
+  })
 
   win.on('closed', () => {
     win = undefined
@@ -1783,7 +2101,16 @@ function buildMenu() {
   ]
 
   const template = [
-    ...(isMac ? [{ role: 'appMenu' }] : []),
+    // macOS 的应用菜单（关于/服务/隐藏/退出）由系统约定提供；
+    // Windows 没有这一层，必须自己给一个「文件 → 退出」，否则菜单里根本没有退出入口。
+    ...(isMac
+      ? [{ role: 'appMenu' }]
+      : [
+          {
+            label: '文件',
+            submenu: [{ role: 'quit', label: '退出' }]
+          }
+        ]),
     {
       label: '引擎',
       submenu: engineItems
@@ -1846,6 +2173,75 @@ function buildMenu() {
   ]
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+
+  // 菜单栏的显隐交给窗口选项 `autoHideMenuBar`（见 createWindow 里的说明）：
+  // 这里**不要**调 setMenuBarVisibility，那会连带把 titleBarOverlay 的窗口按钮干掉。
+  // 重建菜单不会让菜单栏冒出来 —— autoHideMenuBar 管的就是这个。
+}
+
+// ── 托盘（Windows）───────────────────────────────────────────────────────
+//
+// 菜单栏收起来之后，功能不能跟着一起藏没：托盘右键是 Windows 用户习惯的入口。
+// 这里只放最常用的几项 —— 完整的菜单仍在，按 Alt 就能看到。
+//
+// macOS 不做托盘：那边有系统菜单栏，App 菜单本身就是系统约定的一部分，
+// 再加一个托盘图标反而是多余的。
+
+let tray
+
+/**
+ * 「收进托盘」的首次提示：只弹一次（每次启动算一次）。
+ *
+ * 关窗之后窗口不见了、任务栏也没了，如果不说一声，用户会以为应用崩了或者被关了 ——
+ * 而实际上后端还在跑、长任务还在继续。所以第一次收进托盘时用气泡说明一下怎么找回。
+ */
+let backgroundHintShown = false
+
+function hintBackgroundOnce() {
+  if (backgroundHintShown) return
+  backgroundHintShown = true
+  log('窗口已收进托盘，应用继续在后台运行（后端与长任务不受影响）')
+  try {
+    tray?.displayBalloon?.({
+      title: 'DSH Desktop Min 仍在后台',
+      content: '长任务会继续执行。左键点托盘图标唤回窗口，右键可完全退出。'
+    })
+  } catch (error) {
+    // 气泡只是个提示，失败不影响任何功能
+    log('托盘气泡提示失败:', String(error?.message || error))
+  }
+}
+
+/** 托盘图标：打包后 build/icon.png 也在包里（见 electron-builder.yml 的 files）。 */
+function trayIconPath() {
+  return path.join(__dirname, 'build', 'icon.png')
+}
+
+function createTray() {
+  if (process.platform !== 'win32' || tray) return
+  try {
+    const icon = nativeImage.createFromPath(trayIconPath())
+    if (icon.isEmpty()) {
+      log('托盘图标读取失败，跳过托盘:', trayIconPath())
+      return
+    }
+    tray = new Tray(icon.resize({ width: 16, height: 16 }))
+    tray.setToolTip('DSH Desktop Min')
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: '显示窗口', click: () => focusWindow() },
+        { type: 'separator' },
+        { label: '检查更新…', click: () => void checkForUpdates() },
+        { label: '测试通知权限…', click: () => void testNotificationPermission() },
+        { type: 'separator' },
+        { label: '退出', click: () => app.quit() }
+      ])
+    )
+    // 左键直接唤回窗口：双击托盘图标没反应是 Windows 上最常见的困惑之一
+    tray.on('click', () => focusWindow())
+  } catch (error) {
+    log('创建托盘失败:', String(error?.message || error))
+  }
 }
 
 // ── 生命周期 ────────────────────────────────────────────────────────────
@@ -1899,6 +2295,11 @@ app.on('before-quit', (event) => {
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
+  // Windows 的 toast 通知要求进程有一个 AppUserModelID，并且系统里存在与之匹配的
+  // 开始菜单快捷方式（NSIS 安装包会建）。少了它，`isSupported()` 仍然返回 true，
+  // 但投递会被系统静默丢弃 —— 这正是「测试通知」按钮存在的意义。
+  if (process.platform === 'win32') app.setAppUserModelId('com.dsh.desktopmin')
+
   app.on('second-instance', () => {
     if (win) {
       if (win.isMinimized()) win.restore()
@@ -1930,6 +2331,7 @@ if (!app.requestSingleInstanceLock()) {
 
     buildMenu()
     createWindow()
+    createTray()
 
     // 冷启动也走接管页。
     //
@@ -1955,9 +2357,9 @@ if (!app.requestSingleInstanceLock()) {
         steps: []
       })
 
-      // port 0 = 让系统分配空闲端口，避免和你在终端里跑的 dsh 抢端口。
+      // 优先用固定端口（见 PREFERRED_BACKEND_PORT 的说明），被占用才回落随机端口。
       // 孤儿后端由 watchdog.js 负责（壳一死就收尸），这里不用管。
-      const started = await startBackend(0)
+      const started = await startBackend(await backendPort())
       if (!started.ok) {
         dialog.showErrorBox('启动 dsh 失败', String(started.error || '未知错误').slice(0, 1200))
         app.quit()
