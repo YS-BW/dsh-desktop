@@ -1,4 +1,4 @@
-# dsh-desktop
+# DSH Desktop Min
 
 把**官方** DeepSeek Harness Web UI 装进一个原生 macOS 窗口 —— **零补丁，插件可选**。
 
@@ -6,6 +6,11 @@
 > It ships the stock web UI in a native window with **zero patches and optional plugins**, and shares
 > sessions/config with the official `dsh` CLI. Engine updates come straight from npm, so upgrading
 > DSH never requires rebuilding the app.
+>
+> 仓库名 `dsh-desktop-min` 里的 **min** 是认真的：整个壳只有六个文件、约三千多行，
+> 而且**不给 Harness 打任何补丁**。社区里有好几个同名 `dsh-desktop` 项目走的是另一条路
+> —— vendor 整份 Harness 再叠一层补丁，功能多得多，代价是上游每动一次都要跟一次。
+> 两条路的取舍见「[和社区项目的区别](#和社区项目的区别)」。
 
 ---
 
@@ -644,6 +649,46 @@ bbox 完全一致。**
 是边缘抗锯齿的阈值差异，不是形状错误。
 
 </details>
+
+## 和社区项目的区别
+
+叫 `dsh-desktop` 的项目有好几个（`anywhere-labs`、`dataelement` 等，star 都比这里多得多）。
+撇开体量，真正的分歧只有一条：**怎么对待上游**。
+
+**社区主流做法是 vendor + 打补丁。** 以 `dataelement/dsh-desktop` 为例，它把整份 Harness
+以 tarball 形式放进仓库，用 `file:` 引用一百多个包：
+
+```jsonc
+"@deepseek-ai/dsh": "file:packages/harness-0.1.2-rc.1/npm-dsh/deepseek-ai-dsh-0.1.2-rc.1.tgz"
+"dsh-desktop-client-ui":    "file:packages/dsh-desktop-client-ui"     // 自己的 UI 插件
+"dsh-desktop-hmr-fallback": "file:packages/dsh-desktop-hmr-fallback"  // 顶替 HMR 的补丁包
+```
+
+它文档目录里有 `harness-0.1.2-upgrade.md`、`…alpha.3…`、`…alpha.4…`、`…rc.1…`
+**四份上游迁移文档** —— 这就是这条路的价格：上游每动一次，都要跟一次。
+
+**这个项目只依赖三个公开约定**（`web` 子命令、`DSH_HOME` 环境变量、stdout 那行 URL），
+所以引擎能直接从 npm 升，不用重发 App：
+
+| | 本项目 | 社区 vendor 路线 |
+|---|---|---|
+| 上游依赖 | 普通 npm 依赖，跟随 latest | vendor 进仓库 + patch layer |
+| Harness 进程 | **自带真 node 二进制** | Electron UtilityProcess（需 `hmr-fallback` 顶替 HMR）|
+| 数据目录 | **默认 `~/.dsh`，与命令行 dsh 共用** | App 私有 `userData/harness/` |
+| 引擎更新 | 运行时从 npm 拉，3 道关卡验证，可回滚 | 整包自动更新 |
+| 平台 / 签名 | macOS arm64，ad-hoc（未公证）| macOS + Windows，Apple 公证 |
+| 额外功能 | 原生通知、菜单栏升级、升级接管页、选装插件 | 手机配对、PPT 生成、预设包、Safe Mode、插件市场 |
+
+### 为什么这条路上不需要 `hmr-fallback`
+
+Electron 的 utility process 里，`--expose-internals` 能进 `execArgv`，却**进不了 Node 的
+选项解析器**，于是 `ctx.loader.internal` 缺失，Cordis 的 HMR 服务构造函数直接抛异常 ——
+把整个 profile 启动一起带崩。社区为此写了一个假的 `hmr` 服务顶上去，真 HMR 只能放弃。
+
+本项目的做法是**在 App 里带一个真正的 node 二进制**，用 `node <bin.js>` 启动而不是借
+Electron 的 utility process。这条路根本不存在，所以一个补丁包都不需要。
+
+**取舍是明确的**：这边功能面窄得多，也没有公证；换来的是上游怎么升都不痛。
 
 ## 文件
 
