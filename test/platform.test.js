@@ -85,13 +85,19 @@ test('isExecutableFile requires a PATHEXT suffix on Windows only', (t) => {
   const text = path.join(dir, 'notes.txt')
   fs.writeFileSync(text, '')
 
-  assert.equal(isExecutableFile(shim), true)
   assert.equal(isExecutableFile(text), false)
   assert.equal(isExecutableFile(path.join(dir, 'missing.cmd')), false)
   if (isWindows) {
+    // Windows 按 PATHEXT 判后缀，跟 x 位无关
+    assert.equal(isExecutableFile(shim), true)
     // 无后缀的文件在 Windows 上不是命令 —— 这正是 npm 全局目录里那个 0 字节 `dsh` 壳的情况
     assert.equal(isExecutableFile(bare), false)
   } else {
+    // POSIX 看的是 x 位：writeFileSync 建出来的是 644，所以先断言「不可执行」，
+    // 加上 x 位之后才成立。之前这里无条件断言 true，导致 macOS/Linux 上必挂。
+    assert.equal(isExecutableFile(shim), false)
+    fs.chmodSync(shim, 0o755)
+    assert.equal(isExecutableFile(shim), true)
     fs.chmodSync(bare, 0o755)
     assert.equal(isExecutableFile(bare), true)
   }
