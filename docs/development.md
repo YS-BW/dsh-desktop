@@ -18,8 +18,9 @@
 | `DSH_MIN_TEST_UPGRADE` | — | 启动后自动跑一次升级流程到指定版本，用来验证接管页（填不存在的版本可走失败路径） |
 | `DSH_MIN_TEST_UPGRADE_DELAY` | `6000` | 上面那个的延迟毫秒数 |
 
-默认工作目录是当前用户的 `~/Documents/DSH`，也可以改 `main.js` 顶部的
-`DEFAULT_WORKSPACE`，或用环境变量覆盖。
+默认工作目录是系统登记的“文档”目录下的 `DSH`：macOS 通常为
+`~/Documents/DSH`，Windows 会自动适配 `%USERPROFILE%\\Documents\\DSH` 或 OneDrive
+重定向后的文档目录。也可以用环境变量覆盖。
 
 > ⚠️ 不要把它默认成 `process.cwd()`。实测 `npm start` 时壳的 cwd 是「这个壳项目自己的目录」，
 > 那会建一个全新的空会话桶，网页端的历史会话一条都看不到；打包后双击启动时 cwd 更是指向别处。
@@ -59,4 +60,3 @@ npm run dist:mac     # 出 DMG + ZIP
 | `build/icon.icns` / `icon.png` / `icon.svg` | 图标成品与留档 |
 | `electron-builder.yml` | 打包配置（含关闭 asar、ad-hoc 签名的原因） |
 | `.npmrc` | Electron 二进制走国内镜像 |
-

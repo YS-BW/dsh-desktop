@@ -41,6 +41,7 @@ files:
   - notify.js
   - watchdog.js
   - output-lines.js
+  - runtime-paths.js
   # 接管页：下载 / 校验 / 重启引擎期间窗口里显示的就是它。
   # 漏了它 = 升级时窗口会切到一个不存在的文件 → 白屏。
   - splash.html

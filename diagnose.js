@@ -13,12 +13,12 @@
 const { app, BrowserWindow } = require('electron')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
+const { resolveDshHome, resolveWorkspace } = require('./runtime-paths')
 
 const REPORT = path.join(__dirname, 'diagnose-report.json')
-const DSH_HOME = process.env.DSH_MIN_HOME || path.join(os.homedir(), '.dsh')
-const WORKSPACE = process.env.DSH_MIN_WORKSPACE || '/Users/lixinlv/Documents/DSH'
+const DSH_HOME = resolveDshHome()
+const WORKSPACE = resolveWorkspace({ app })
 
 const CSS = require('node:fs')
   .readFileSync(path.join(__dirname, 'main.js'), 'utf8')

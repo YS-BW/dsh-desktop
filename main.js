@@ -36,6 +36,7 @@ const { createUpdater } = require('./updater')
 const { PLUGIN_CATALOG, createPluginInstaller, resolvePnpmEntry } = require('./plugin-installer')
 const { createTurnWatcher, formatDuration, summarize } = require('./notify')
 const { createLineReader, extractAuthenticatedUrl } = require('./output-lines')
+const { resolveDshHome, resolveDesktopHome, resolveWorkspace } = require('./runtime-paths')
 const {
   ensureCommandEntry,
   findExecutableIn,
@@ -51,17 +52,13 @@ const {
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
 /** Desktop 自己的数据根目录。引擎等应用数据放在这里。 */
-const DESKTOP_HOME = process.env.DSH_MIN_DESKTOP_HOME
-  ? path.resolve(process.env.DSH_MIN_DESKTOP_HOME)
-  : path.join(os.homedir(), '.dsh-desktop')
+const DESKTOP_HOME = resolveDesktopHome()
 
 /**
  * DSH 数据目录。默认与命令行 dsh 共用 ~/.dsh，因此在停止 Web 后，Desktop 可以
  * 直接接着同一批会话继续工作。DSH_MIN_HOME 仅用于明确指定另一份数据目录。
  */
-const DSH_HOME = process.env.DSH_MIN_HOME
-  ? path.resolve(process.env.DSH_MIN_HOME)
-  : path.join(os.homedir(), '.dsh')
+const DSH_HOME = resolveDshHome()
 
 /**
  * 默认工作目录。
@@ -71,15 +68,13 @@ const DSH_HOME = process.env.DSH_MIN_HOME
  * 会话（在别的目录下）一条都看不到。打包成 .app 双击启动时 cwd 更是指向别处。
  * 所以这里必须显式给出一个真实项目目录。
  *
- * 改这里，或者用 DSH_MIN_WORKSPACE 环境变量覆盖。
+ * 用 DSH_MIN_WORKSPACE 环境变量可以覆盖。
  */
-const DEFAULT_WORKSPACE = path.join(os.homedir(), 'Documents', 'DSH')
-
 /**
  * 工作目录。DSH 按进程 cwd 给会话分桶（$DSH_HOME/sessions/<编码后的cwd>/），
  * 要和网页端看到同一批会话，这个路径必须和你在网页端启动 dsh 时的目录一致。
  */
-const WORKSPACE = path.resolve(process.env.DSH_MIN_WORKSPACE || DEFAULT_WORKSPACE)
+const WORKSPACE = resolveWorkspace({ env: process.env, app })
 
 /**
  * 解析后端引擎：返回 { node, bin, source } 或 undefined。
