@@ -48,6 +48,78 @@ const DEBOUNCE_MS = 150
 /** 兜底轮询间隔。fs.watch 在少数情况下会漏事件，定期 stat 一下更稳。 */
 const POLL_MS = 3000
 
+/** Read enough of one Zstandard frame to locate its exact physical end. */
+function zstdFrameEnd(buffer, start) {
+  let offset = start
+  if (buffer.length - offset < 4) return undefined
+  if (!buffer.subarray(offset, offset + 4).equals(ZSTD_MAGIC)) {
+    throw new Error(`invalid zstd frame magic at byte ${offset}`)
+  }
+  offset += 4
+  if (offset === buffer.length) return undefined
+
+  const descriptor = buffer.readUInt8(offset)
+  offset += 1
+  if ((descriptor & 0x18) !== 0) throw new Error('reserved zstd frame-header bit')
+  const contentSizeFlag = descriptor >>> 6
+  const singleSegment = (descriptor & 0x20) !== 0
+  const checksum = (descriptor & 0x04) !== 0
+  const dictionaryFlag = descriptor & 0x03
+  const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+  const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+  const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+  if (buffer.length - offset < remainingHeaderBytes) return undefined
+  offset += remainingHeaderBytes
+
+  for (;;) {
+    if (buffer.length - offset < 3) return undefined
+    const blockHeader = buffer.readUIntLE(offset, 3)
+    offset += 3
+    const lastBlock = (blockHeader & 1) !== 0
+    const blockType = (blockHeader >>> 1) & 3
+    const blockSize = blockHeader >>> 3
+    if (blockType === 3) throw new Error('reserved zstd block type')
+    const payloadBytes = blockType === 1 ? 1 : blockSize
+    if (buffer.length - offset < payloadBytes) return undefined
+    offset += payloadBytes
+    if (lastBlock) break
+  }
+
+  if (checksum) {
+    if (buffer.length - offset < 4) return undefined
+    offset += 4
+  }
+  return offset
+}
+
+/**
+ * Find the final frame start without loading a potentially huge session file.
+ * Re-reading that one frame establishes a safe baseline even when startup
+ * happens while DSH is halfway through appending it.
+ */
+function findLastFrameStart(filePath, size) {
+  if (size <= 0) return 0
+  const handle = fs.openSync(filePath, 'r')
+  const chunkSize = 64 * 1024
+  let end = size
+  let nextPrefix = Buffer.alloc(0)
+  try {
+    while (end > 0) {
+      const start = Math.max(0, end - chunkSize)
+      const chunk = Buffer.allocUnsafe(end - start)
+      fs.readSync(handle, chunk, 0, chunk.length, start)
+      const searchable = nextPrefix.length > 0 ? Buffer.concat([chunk, nextPrefix]) : chunk
+      const index = searchable.lastIndexOf(ZSTD_MAGIC)
+      if (index !== -1 && index < chunk.length) return start + index
+      nextPrefix = Buffer.from(chunk.subarray(0, Math.min(3, chunk.length)))
+      end = start
+    }
+  } finally {
+    fs.closeSync(handle)
+  }
+  return size
+}
+
 /**
  * @param options.sessionsDir  DSH_HOME/sessions
  * @param options.onTurnEnd    轮次结束时回调 { sessionId, turn, reason, durationMs }
@@ -83,13 +155,12 @@ function createTurnWatcher(options) {
    *
    * 两个关键点，都是实测出来的：
    *
-   * 1. **用 `{ info: true }` 拿 `engine.bytesWritten`** —— 它精确等于「这一帧消耗了多少
-   *    输入字节」。Node 的 zstd 每次调用只解**一帧**，所以这就把帧边界给准了。
-   *    实测：解「一帧 + 5 字节半帧」时只消耗 15 字节（完整那帧），不会越界。
+   * 1. **先解析 zstd 帧结构，再解压精确的一帧**。不能用解压器的 `bytesWritten`
+   *    猜边界：带 checksum 的帧少最后 1～3 字节时，Node 仍可能返回完整明文，
+   *    这会把半帧误认成完整帧并永久推进 offset。
    *
-   * 2. **用「是否以换行结尾」判断帧完不完整** —— 因为 `zstdDecompressSync` 对截断帧
-   *    **不抛错**，而是悄悄返回部分内容（实测：截到 12 字节会返回 "hel"）。所以不能靠
-   *    异常来判断「数据还没写完」。
+   * 2. **换行只作为明文的第二道完整性检查**。`zstdDecompressSync` 对部分截断帧
+   *    不抛错，所以完整性首先由帧头、block 长度和 checksum 长度共同判定。
    *    真实文件里 13318 个帧**全部**以换行结尾（0 例外），因为 dsh 写的是
    *    newline-delimited 的 JSON 行。
    *
@@ -101,22 +172,31 @@ function createTurnWatcher(options) {
     let consumed = 0
 
     while (consumed < buf.length) {
-      let text
-      let bytesWritten = 0
+      let frameEnd
       try {
-        const result = zlib.zstdDecompressSync(buf.subarray(consumed), { info: true })
-        text = result.buffer.toString('utf8')
-        bytesWritten = Number(result.engine?.bytesWritten) || 0
+        frameEnd = zstdFrameEnd(buf, consumed)
       } catch {
-        // 真正的格式错误 —— 停下，保留剩余字节等下次
+        // If a prior run began in the middle of a frame, resynchronize at the
+        // next physical frame so future notifications are not lost forever.
+        const next = buf.indexOf(ZSTD_MAGIC, consumed + 1)
+        if (next === -1) break
+        consumed = next
+        continue
+      }
+      if (frameEnd === undefined) break
+
+      let text
+      try {
+        text = zlib.zstdDecompressSync(buf.subarray(consumed, frameEnd)).toString('utf8')
+      } catch {
+        // A structurally complete frame with a bad checksum is corruption.
+        // Preserve it instead of silently advancing the durable offset.
         break
       }
 
-      if (bytesWritten <= 0) break
-      // 半截帧：解压没抛错，但输出不完整
       if (!text.endsWith('\n')) break
 
-      consumed += bytesWritten
+      consumed = frameEnd
       for (const line of text.split('\n')) {
         if (line.length === 0) continue
         try {
@@ -231,10 +311,11 @@ function createTurnWatcher(options) {
     }
   }
 
-  /** 记下文件当前大小，作为「不回溯历史」的起点。 */
+  /** 从最后一帧起建立基线，既不回放旧轮次，也不会从半帧中间开始。 */
   function baseline(filePath) {
     try {
-      return { offset: fs.statSync(filePath).size, pending: Buffer.alloc(0) }
+      const size = fs.statSync(filePath).size
+      return { offset: findLastFrameStart(filePath, size), pending: Buffer.alloc(0) }
     } catch {
       return { offset: 0, pending: Buffer.alloc(0) }
     }
@@ -328,7 +409,7 @@ function createTurnWatcher(options) {
     pending.clear()
   }
 
-  return { start, stop, _internal: { decodeFrames } }
+  return { start, stop, _internal: { decodeFrames, baseline } }
 }
 
 /**
@@ -365,4 +446,11 @@ function formatDuration(ms) {
   return `${hours} 小时 ${minutes % 60} 分`
 }
 
-module.exports = { createTurnWatcher, formatDuration, summarize, LOG_FILENAME, ZSTD_MAGIC }
+module.exports = {
+  createTurnWatcher,
+  formatDuration,
+  summarize,
+  LOG_FILENAME,
+  ZSTD_MAGIC,
+  _internal: { zstdFrameEnd, findLastFrameStart }
+}

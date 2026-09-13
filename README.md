@@ -1,9 +1,9 @@
 # dsh-desktop
 
-把**官方** DeepSeek Harness Web UI 装进一个原生 macOS 窗口 —— **零补丁、零插件**。
+把**官方** DeepSeek Harness Web UI 装进一个原生 macOS 窗口 —— **零补丁，插件可选**。
 
 > A minimal Electron shell for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
-> It ships the stock web UI in a native window with **zero patches and zero plugins**, and shares
+> It ships the stock web UI in a native window with **zero patches and optional plugins**, and shares
 > sessions/config with the official `dsh` CLI. Engine updates come straight from npm, so upgrading
 > DSH never requires rebuilding the app.
 
@@ -11,7 +11,7 @@
 
 ## 它是什么
 
-一个 Electron 壳（`main.js` + `updater.js` + `notify.js` + `watchdog.js`，约 2500 行）。
+一个 Electron 壳（`main.js` + `updater.js` + `plugin-installer.js` + `notify.js` + `watchdog.js`）。
 它**不重新实现任何界面**，也**不修改 dsh 的任何文件**：
 窗口里加载的就是 `dsh web` 提供的那个官方 Web UI，和你浏览器里看到的是同一套前端。
 
@@ -22,19 +22,22 @@ Electron 壳  ──spawn──>  node <dsh>/lib/bin.js web --no-open --host 127
      └─ 把那个 URL 加载进窗口
 ```
 
-壳与 dsh 之间只有**三个公开约定**：
+壳与 dsh 之间只使用这些**公开约定**：
 
 | 约定 | 内容 |
 |---|---|
 | 命令行 | `web --no-open --host 127.0.0.1 --port <n>` |
+| 插件命令 | `plugin --profile web <pnpm args>`、`--profile web --dump-config` |
 | 环境变量 | `DSH_HOME`（数据目录）、进程 cwd（工作目录） |
 | stdout | 启动时那一行 `dsh web: <带 token 的 URL>` |
 
-因为只依赖这些，**dsh 官方怎么升级都不会破坏这个壳**。
+核心启动链只依赖这些公开约定；通知和桌面样式还会读取会话日志并使用 Web UI 的稳定结构，
+所以升级器会在切换前做兼容性验证，桌面增强部分仍需随上游版本回归测试。
 
 壳额外补的是网页做不到的那部分：
 
 - **原生通知** —— 一轮跑完弹系统通知，点一下回到窗口（[见下文](#原生通知一轮跑完提醒你)）
+- **初始化可选插件** —— 首次安装或覆盖重装时可以一次性选装，默认全部不勾选
 - **菜单栏升级引擎** —— 检测 / 升级 / 回滚，不依赖任何 dsh 插件；升级期间窗口由自带接管页接管
 - **窗口拖拽区、macOS 红绿灯让位** —— 修掉官方 Web UI 当桌面应用时的两个手感问题
 - **后端生命周期** —— 壳一死，后端进程跟着死，不留孤儿
@@ -48,6 +51,32 @@ Electron 壳  ──spawn──>  node <dsh>/lib/bin.js web --no-open --host 127
 > **首次打开**：包没有做代码签名与公证，macOS 会拦住。任选其一：
 > - 右键点 App → **打开** → 再点「打开」
 > - 或执行一次：`xattr -dr com.apple.quarantine "/Applications/DSH Desktop Min.app"`
+
+## 初始化时选装插件
+
+首次启动 App，或 App 被覆盖重装后，启动 DSH 之前会先显示一次选装页。
+它是初始化流程的一步，**不是插件管理器，也不在菜单栏保留入口**。
+两个选项默认都不勾选，点「跳过」或「继续」就直接启动原生 DSH。
+
+首版可选：
+
+| 页面名称 | 实际 npm 包 | 用途 |
+|---|---|---|
+| DSH Market（dsh-market） | `dshmarket` | 在 DSH 内浏览和管理更多社区插件 |
+| Better Sidebar | `dsh-better-sidebar` | 增加类 VS Code 的右侧边栏 |
+
+`dsh-better-slide` 没有可安装的同名包，所以此处接入已发布的 `dsh-better-sidebar`。
+
+安装链只调用 DSH 公开命令：
+
+```text
+dsh plugin --profile web add <package>
+dsh --profile web --dump-config
+```
+
+选中的插件会先安装并组装整棵 profile 配置，通过后再启动后端。如果配置或实际启动失败，
+壳会在内部用相反的公开 CLI 操作恢复本次安装前状态。此后插件更新、卸载与其他管理由 DSH 自己负责；
+壳不会直接改 DSH 的 `package.json` 或源码。
 
 ## 引擎：自带一份 + 菜单里从 npm 升级
 
@@ -123,7 +152,7 @@ App 启动后 8 秒会**静默检查一次**更新：有新版才在菜单里出
 
 **为什么进度条是不确定态**：引擎冷启动实测约 2.1 秒，加上 npm 安装和页面加载，总时长在不同机器上差很多。动画自己不知道要转多久，所以不做假进度，改由事件收尾（新后端 stdout 就绪 → `loadIntoWindow`）。
 
-**数据通道刻意是单向的**：主进程 `executeJavaScript` 调 `window.__dshSplash.update()`，**不引入 preload**。那个窗口的 `webPreferences` 是为**远端** dsh 页面设的（`sandbox` + `contextIsolation` + 无 preload），给本地页面开 IPC 就等于给远端页面也开了一个洞。要放按钮才需要 preload，那时必须按 `location.protocol === 'file:'` 门控。
+**数据通道刻意是单向的**：主进程 `executeJavaScript` 调用本地页更新状态，**不引入 preload**。那个窗口的 `webPreferences` 是为**远端** dsh 页面设的（`sandbox` + `contextIsolation` + 无 preload），给本地页面开 IPC 就等于给远端页面也开了一个洞。初始化页的按钮只能导航到白名单化的 `dsh-setup://` 意图，主进程同时校验当前页必须是 App 内置的初始化页。
 
 **同一个页面顺手解决了冷启动白屏**：原来 `createWindow()` 之后窗口先 show 一块空白，一直等到后端从 stdout 报出 URL 才 `loadURL` —— 中间那 ~2 秒是白屏。现在先显示「正在启动引擎」，就绪后自然切走。
 
@@ -167,6 +196,8 @@ dsh 插件活在**要被替换的那个进程**里，让它编排自己的替换
 回滚是**交换语义**（滚回去之后，刚才那个版本变成新的「上一个版本」），所以误操作可以再滚回来。
 
 回滚**只改指针，不动任何已安装的文件**，所以不会丢东西。
+App 覆盖更新后还会重新校验这两个指针：如果旧回退版本既没有安装目录、也不再是当前 App
+的自带版本，就会清掉这条失效记录，菜单不会继续显示一个实际无法启动的回退目标。
 
 ### 为什么这些都只依赖公开接口
 
@@ -217,16 +248,18 @@ HMR 构造失败会直接带崩整个 profile 启动（报错原文：`--expose-
 |---|---|---|
 | `DSH_MIN_HOME` | `~/.dsh` | DSH 数据目录。默认与命令行 `dsh` 共用 |
 | `DSH_MIN_WORKSPACE` | 见下 | 工作目录。决定会话分桶，必须与你网页端启动 dsh 时的目录一致 |
-| `DSH_MIN_DESKTOP_HOME` | `~/.dsh-desktop` | 本 App 自己的数据根目录（目前只放从 npm 更新的引擎） |
+| `DSH_MIN_DESKTOP_HOME` | `~/.dsh-desktop` | 本 App 自己的数据根目录（更新引擎、初始化完成标记等） |
 | `DSH_MIN_BIN` | 自动解析 | 直接指定 dsh 入口，跳过引擎解析链 |
 | `DSH_MIN_TOP_PAD` | `30` | macOS 红绿灯顶部留白（像素），嫌挤或嫌空可以调 |
 | `DSH_MIN_ATTACH` | — | 接入一个已在运行的实例（需要它带 token 的启动 URL） |
+| `DSH_MIN_SKIP_SETUP` | — | `1` 时跳过初始化选装页，供自动化测试和调试使用 |
 | `DSH_MIN_TRACE_NAV` | — | `1` 时打印渲染进程的导航事件，用来判断页面有没有偷偷重载 |
 | `DSH_MIN_TRACE_NET` | — | `1` 时打印 loopback 上的失败请求（≥400）和 `/plugins/` 请求 —— 定位 431 就靠它 |
 | `DSH_MIN_TEST_UPGRADE` | — | 启动后自动跑一次升级流程到指定版本，用来验证接管页（填不存在的版本可走失败路径） |
 | `DSH_MIN_TEST_UPGRADE_DELAY` | `6000` | 上面那个的延迟毫秒数 |
 
-默认工作目录写在 `main.js` 顶部的 `DEFAULT_WORKSPACE` 常量里，**改它或用环境变量覆盖**。
+默认工作目录是当前用户的 `~/Documents/DSH`，也可以改 `main.js` 顶部的
+`DEFAULT_WORKSPACE`，或用环境变量覆盖。
 
 > ⚠️ 不要把它默认成 `process.cwd()`。实测 `npm start` 时壳的 cwd 是「这个壳项目自己的目录」，
 > 那会建一个全新的空会话桶，网页端的历史会话一条都看不到；打包后双击启动时 cwd 更是指向别处。
@@ -240,8 +273,8 @@ npm run pack         # 只打包成 .app（不压缩，快）
 npm run dist:mac     # 出 DMG + ZIP
 ```
 
-> `npm install` 会装三个运行时依赖：`@deepseek-ai/dsh`（引擎）、`node`（Node 二进制）、
-> `npm`（升级引擎时要调它）。`node` 的二进制由它自己的 preinstall 下载，而我们用
+> `npm install` 会装四个运行时依赖：`@deepseek-ai/dsh`（引擎）、`node`（Node 二进制）、
+> `npm`（升级引擎时要调它）和 `pnpm`（DSH 公开插件命令使用）。`node` 的二进制由它自己的 preinstall 下载，而我们用
 > `--ignore-scripts` 装依赖，所以 `package.json` 里挂了个 `postinstall` 把它补回来 ——
 > 少了这一步，打包出来的 App 会因为缺 node 而启动失败。
 
@@ -415,10 +448,10 @@ $DSH_HOME/sessions/<编码后的 cwd>/<session-id>/session.jsonl.zstd
 
 有三个坑值得记下来：
 
-1. **zstd 截断不报错**。读到半帧时 `zstdDecompressSync` 会**静默返回不完整内容**而不抛异常，
-   于是「读到一半」和「读到一个完整帧」长得一模一样。解法是用 `{info:true}` 拿到
-   `engine.bytesWritten` 作为精确帧边界，再要求解出的文本**必须以换行结尾**才认账。
-   （实测 13318 个真实帧，13318 个都以 `\n` 结尾。）
+1. **zstd 截断不一定报错**。尤其带 checksum 的帧只缺最后 1～3 字节时，Node 仍可能
+   返回完整明文。现在先解析帧头和 block 长度，确认 checksum 也完整，再解压该精确帧；
+   明文以换行结尾作为第二道检查。启动监听时会回到最后一帧的起点，所以即使恰好撞上
+   正在写入的半帧，写完后仍能正确消费。
 2. **摘要只能取正文**。`assistant/message` 里可能同时有 `text` 和 `reasoning`，
    只取 `text`；纯工具调用的消息不能覆盖已有摘要，否则通知正文会变成一串函数名。
 3. **新文件注册完必须立刻消费**。`sweep()` 发现新会话文件时只登记了「从 0 开始读」
@@ -616,11 +649,14 @@ bbox 完全一致。**
 
 | 文件 | 作用 |
 |---|---|
-| `main.js` | 壳逻辑 + 「引擎」「通知」菜单：起窗口、解析引擎、拉后端、注入样式、生命周期 |
+| `main.js` | 壳逻辑 + 「引擎」「通知」菜单：初始化、起窗口、解析引擎、拉后端、注入样式、生命周期 |
 | `updater.js` | 引擎升级器：检测、安装、关卡、提升、回滚 |
+| `plugin-installer.js` | 初始化插件白名单、DSH CLI 调用、配置验证与失败恢复 |
+| `setup.html` | 首次安装 / 覆盖重装时显示的可选插件初始化页 |
 | `notify.js` | 会话日志 tail + 轮次结束解析（zstd 分帧解码、摘要提取） |
 | `splash.html` | 接管页：下载 / 校验 / 重启引擎期间窗口里显示的就是它 |
 | `watchdog.js` | 独立看门狗进程，壳异常结束时收尸 |
+| `output-lines.js` | 把任意分块的后端输出还原成完整行，避免漏读或截断启动 token |
 | `diagnose.js` | 布局与拖拽区域的诊断工具 |
 | `tools/make-icon.js` | 从官方 favicon 生成 `build/icon.icns`（借 Electron 的 Chromium 渲染） |
 | `build/icon.icns` / `icon.png` / `icon.svg` | 图标成品与留档 |
@@ -637,7 +673,7 @@ bbox 完全一致。**
 - **只支持 macOS arm64**。其它平台改 `electron-builder.yml` 的 target 理论上可行，但没验证过。
 - **`--port 0` 会每次留一条 cookie**，靠启动时清理兜住（见「会话 cookie 累积 → HTTP 431」）。想彻底根治得改成固定端口。
 - **单写者约束**：见上文，不要同时跑两个后端。
-- **不自带第三方插件市场**。要装社区插件用命令行的 `dsh plugin add`。
+- **初始化选装首版只有两个白名单项**，完成向导后不在菜单中提供插件管理入口。
 - **升级需要联网**，走 npm 的 registry（读你的 `~/.npmrc`，所以配了镜像就自动走镜像）。
 - **引擎只保留「当前 + 上一个」**：能回滚的只有一步，再早的留着纯占磁盘（**一个约 280MB**），
   所以每次切换完和每次启动都会自动清掉更旧的。菜单里不再需要「删除旧引擎」。

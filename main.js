@@ -21,7 +21,9 @@ const os = require('node:os')
 const path = require('node:path')
 const { createRequire } = require('node:module')
 const { createUpdater } = require('./updater')
+const { PLUGIN_CATALOG, createPluginInstaller } = require('./plugin-installer')
 const { createTurnWatcher, formatDuration, summarize } = require('./notify')
+const { createLineReader, extractAuthenticatedUrl } = require('./output-lines')
 
 // ── 可覆盖的配置（都有默认值，不设就是「跟官方共用」）─────────────────────
 
@@ -40,7 +42,7 @@ const DSH_HOME = process.env.DSH_MIN_HOME
  *
  * 改这里，或者用 DSH_MIN_WORKSPACE 环境变量覆盖。
  */
-const DEFAULT_WORKSPACE = '/Users/lixinlv/Documents/DSH'
+const DEFAULT_WORKSPACE = path.join(os.homedir(), 'Documents', 'DSH')
 
 /**
  * 工作目录。DSH 按进程 cwd 给会话分桶（$DSH_HOME/sessions/<编码后的cwd>/），
@@ -388,6 +390,10 @@ let engineStatus = {
   lastError: undefined
 }
 
+/** 插件操作串行化：pnpm 不应同时改同一个 web profile。 */
+let setupBusy = false
+let pluginInstallerInstance
+
 // ── 运行状态 ────────────────────────────────────────────────────────────
 
 let child
@@ -400,6 +406,62 @@ let quitting = false
 let swapping = false
 
 const log = (...args) => console.log('[dsh-min]', ...args)
+
+/**
+ * 初始化插件安装器懒建。
+ *
+ * DSH 的公开 plugin 命令会从 PATH 调用 pnpm，所以把 App 自带的
+ * `node_modules/.bin` 放到最前面。这不依赖用户是否预装 Node/pnpm。
+ */
+function pluginInstaller() {
+  if (pluginInstallerInstance) return pluginInstallerInstance
+  const appModules = path.join(app.getAppPath(), 'node_modules')
+  const bundledNode = bundledNodePath()
+  pluginInstallerInstance = createPluginInstaller({
+    resolveEngine,
+    dshHome: DSH_HOME,
+    workspace: WORKSPACE,
+    executableDirs: [
+      ensurePluginPnpmDir(),
+      path.join(appModules, '.bin'),
+      bundledNode ? path.dirname(bundledNode) : undefined
+    ],
+    log
+  })
+  return pluginInstallerInstance
+}
+
+/**
+ * electron-builder 会打包 pnpm 的 CLI，但会丢掉 `node_modules/.bin/pnpm` 链接。
+ * DSH 的公开 plugin 命令通过 PATH 执行 `pnpm`，因此在 App 外的可写目录
+ * 建一条绝对路径链接。App 更新后目标路径变了，下次使用时会原子替换。
+ */
+function ensurePluginPnpmDir() {
+  try {
+    const require = createRequire(path.join(app.getAppPath(), 'package.json'))
+    // pnpm 只导出包根，而根入口正好就是 package.json。
+    // 不能 resolve `pnpm/package.json`，那会被 package exports 拒绝。
+    const manifest = require.resolve('pnpm')
+    const target = path.join(path.dirname(manifest), 'bin', 'pnpm.mjs')
+    if (!fs.existsSync(target)) return undefined
+
+    const binDir = path.join(DESKTOP_HOME, 'bin')
+    const command = path.join(binDir, 'pnpm')
+    fs.mkdirSync(binDir, { recursive: true })
+    try {
+      if (fs.realpathSync(command) === fs.realpathSync(target)) return binDir
+    } catch {}
+
+    const temp = `${command}.tmp-${process.pid}`
+    fs.rmSync(temp, { force: true })
+    fs.symlinkSync(target, temp)
+    fs.renameSync(temp, command)
+    return binDir
+  } catch (error) {
+    log('准备自带 pnpm 失败:', String(error?.message || error))
+    return undefined
+  }
+}
 
 // ── 孤儿后端清理 ────────────────────────────────────────────────────────
 
@@ -432,91 +494,149 @@ function startWatchdog(backendPid) {
  * 是进程级随机、且只接受 `GET /?token=` 一种兑换方式（API 路径和 Authorization
  * 头都不认）。所以只能从 stdout 拿 —— 这是官方提供的唯一入口。
  */
-function extractAuthenticatedUrl(text) {
-  const match = text.match(/dsh web:\s*(http:\/\/127\.0\.0\.1:\d+\/\?token=[A-Za-z0-9_-]+)/)
-  return match ? match[1] : undefined
-}
-
 /** 剥掉 ANSI 转义，避免颜色码把 URL 切碎。 */
 const stripAnsi = (s) => s.replace(/\u001B\[[0-9;]*m/g, '')
 
+const BACKEND_START_TIMEOUT_MS = 45_000
+
+/**
+ * 启动当前选中的引擎，等它输出一整行带凭据的 URL 后才算成功。
+ * 换引擎时由调用方处理失败，这样可以先恢复旧指针再向用户报错。
+ */
 function startBackend(port) {
-  const engine = resolveEngine()
-  if (!engine) {
-    dialog.showErrorBox(
-      '找不到 dsh 引擎',
-      '这个 App 自带引擎，正常情况下不该出现这个提示。\n\n' +
-        '请重新下载安装包，或用 DSH_MIN_BIN 环境变量指定 dsh 的路径。'
-    )
-    app.quit()
-    return
-  }
+  return new Promise((resolve) => {
+    let settled = false
+    let startupFailure
+    let recentOutput = ''
+    let startupTimer
 
-  fs.mkdirSync(WORKSPACE, { recursive: true })
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      if (startupTimer) clearTimeout(startupTimer)
+      resolve(result)
+    }
 
-  const args = [
-    'web',
-    '--no-open', // 窗口就是唯一的界面，不要再弹浏览器
-    '--host',
-    '127.0.0.1',
-    '--port',
-    String(port)
-  ]
+    const engine = resolveEngine()
+    if (!engine) {
+      finish({
+        ok: false,
+        error:
+          '找不到 dsh 引擎。这个 App 正常情况下应自带引擎；请重新安装，或用 DSH_MIN_BIN 指定入口。'
+      })
+      return
+    }
 
-  // 自带/更新的引擎：node <bin.js> web ...；系统 dsh：dsh web ...
-  const command = engine.node ?? engine.bin
-  const argv = engine.node ? [engine.bin, ...args] : args
+    try {
+      fs.mkdirSync(WORKSPACE, { recursive: true })
+    } catch (error) {
+      finish({
+        ok: false,
+        error: `无法创建工作目录 ${WORKSPACE}：${String(error.message || error)}`
+      })
+      return
+    }
 
-  log(`启动后端（${engine.source}）:`, command, argv.join(' '))
-  log('  DSH_HOME =', DSH_HOME)
-  log('  cwd      =', WORKSPACE)
+    const args = [
+      'web',
+      '--no-open', // 窗口就是唯一的界面，不要再弹浏览器
+      '--host',
+      '127.0.0.1',
+      '--port',
+      String(port)
+    ]
 
-  child = spawn(command, argv, {
-    cwd: WORKSPACE,
-    env: backendEnv(),
-    stdio: ['ignore', 'pipe', 'pipe']
-  })
+    // 自带/更新的引擎：node <bin.js> web ...；系统 dsh：dsh web ...
+    const command = engine.node ?? engine.bin
+    const argv = engine.node ? [engine.bin, ...args] : args
 
-  const onChunk = (buf) => {
-    const text = stripAnsi(buf.toString())
-    process.stdout.write(text)
-    if (!baseUrl) {
-      const url = extractAuthenticatedUrl(text)
-      if (url) {
-        baseUrl = url
-        ownsChild = true
-        log('后端就绪:', url.replace(/token=.*/, 'token=<hidden>'))
-        loadIntoWindow(url)
-        startNotifier()
+    log(`启动后端（${engine.source}）:`, command, argv.join(' '))
+    log('  DSH_HOME =', DSH_HOME)
+    log('  cwd      =', WORKSPACE)
+
+    let backend
+    try {
+      backend = spawn(command, argv, {
+        cwd: WORKSPACE,
+        env: backendEnv(),
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    } catch (error) {
+      finish({ ok: false, error: String(error.message || error) })
+      return
+    }
+    child = backend
+    ownsChild = true
+
+    const onLine = (line) => {
+      if (!baseUrl) {
+        const url = extractAuthenticatedUrl(stripAnsi(line))
+        if (url) {
+          baseUrl = url
+          log('后端就绪:', url.replace(/token=.*/, 'token=<hidden>'))
+          void loadIntoWindow(url)
+          startNotifier()
+          finish({ ok: true, url, engine: engine.source })
+        }
       }
     }
-  }
 
-  child.stdout.on('data', onChunk)
-  child.stderr.on('data', onChunk)
-
-  child.on('error', (error) => {
-    dialog.showErrorBox('启动 dsh 失败', String(error.message || error))
-    app.quit()
-  })
-
-  // 后端起得来才需要看门狗；spawn 失败时没有子进程可看。
-  if (child.pid !== undefined) startWatchdog(child.pid)
-
-  child.on('exit', (code, signal) => {
-    log('后端退出:', { code, signal })
-    child = undefined
-    // swapping：这次退出是我们自己为换引擎而杀的，属于正常流程。
-    // 少了这个判断，restartBackend() 会命中下面这条「报错并退出应用」——
-    // 也就是「立即重启」实际上是坏的：它会弹一个「后端已退出」然后把 App 关掉。
-    if (!quitting && !swapping) {
-      // 后端没了，窗口留着也没意义；正常退出路径由 before-quit 处理。
-      dialog.showErrorBox(
-        '后端已退出',
-        `dsh 进程结束了（code=${code} signal=${signal}）。请重新启动应用。`
-      )
-      app.quit()
+    const stdoutLines = createLineReader(onLine)
+    const stderrLines = createLineReader(onLine)
+    const onChunk = (reader, buf) => {
+      const text = buf.toString()
+      process.stdout.write(text)
+      recentOutput = `${recentOutput}${stripAnsi(text)}`.slice(-1200)
+      reader.push(buf)
     }
+    backend.stdout.on('data', (buf) => onChunk(stdoutLines, buf))
+    backend.stderr.on('data', (buf) => onChunk(stderrLines, buf))
+
+    backend.on('error', (error) => {
+      startupFailure = String(error.message || error)
+      finish({ ok: false, error: startupFailure })
+    })
+
+    // 后端起得来才需要看门狗；spawn 失败时没有子进程可看。
+    if (backend.pid !== undefined) startWatchdog(backend.pid)
+
+    backend.on('exit', (code, signal) => {
+      log('后端退出:', { code, signal })
+      if (child === backend) child = undefined
+      if (!settled) {
+        const detail = recentOutput.trim().slice(-600)
+        finish({
+          ok: false,
+          error:
+            startupFailure ||
+            `dsh 在就绪前退出（code=${code} signal=${signal}）${detail ? `：${detail}` : ''}`
+        })
+        return
+      }
+      // swapping：这次退出是我们自己为换引擎而杀的，属于正常流程。
+      // 少了这个判断，restartBackend() 会命中下面这条「报错并退出应用」——
+      // 也就是「立即重启」实际上是坏的：它会弹一个「后端已退出」然后把 App 关掉。
+      if (!quitting && !swapping) {
+        // 后端没了，窗口留着也没意义；正常退出路径由 before-quit 处理。
+        dialog.showErrorBox(
+          '后端已退出',
+          `dsh 进程结束了（code=${code} signal=${signal}）。请重新启动应用。`
+        )
+        app.quit()
+      }
+    })
+
+    startupTimer = setTimeout(() => {
+      startupFailure =
+        `等待 dsh 启动超时（${BACKEND_START_TIMEOUT_MS} ms）` +
+        (recentOutput.trim() ? `：${recentOutput.trim().slice(-600)}` : '')
+      try {
+        backend.kill('SIGKILL')
+      } catch {
+        finish({ ok: false, error: startupFailure })
+      }
+    }, BACKEND_START_TIMEOUT_MS)
+    startupTimer.unref?.()
   })
 }
 
@@ -552,18 +672,66 @@ function stopBackend({ forceAfterMs = 7000 } = {}) {
  * 窗口先交给接管页 —— 否则用户会盯着一个已经死掉的 dsh 页面看 2 秒。
  * 新后端起好之后，startBackend 的 onChunk 会把 dsh 页面接回来。
  */
-async function restartBackend({ phase = '正在重启引擎' } = {}) {
+async function restartBackend({
+  phase = '正在重启引擎',
+  rollbackOnFailure = false,
+  recoverOnFailure,
+  recoveryPhase = '更改后启动失败，正在恢复原状态',
+  recoveryMessage = '更改后启动失败，已恢复原状态'
+} = {}) {
   log('重启后端…')
   await showSplash({ phase, detail: '窗口马上回来', percent: null, steps: [] })
-  // swapping 让 child 的 exit 处理器知道这次退出是预期行为。
+  let started
+  let switchError
   swapping = true
   try {
     await stopBackend()
+    baseUrl = undefined
+    started = await startBackend(0)
+    if (started.ok) return started
+
+    switchError = started.error
+    if (rollbackOnFailure || typeof recoverOnFailure === 'function') {
+      const restoredPointer =
+        typeof recoverOnFailure === 'function' ? await recoverOnFailure() : updater()?.rollback()
+      if (restoredPointer?.ok) {
+        pushSplash({
+          phase:
+            typeof recoverOnFailure === 'function'
+              ? recoveryPhase
+              : `新引擎启动失败，正在恢复 ${restoredPointer.version}`,
+          detail: '窗口马上回来',
+          percent: null,
+          steps: []
+        })
+        baseUrl = undefined
+        const restored = await startBackend(0)
+        if (restored.ok) {
+          log(`启动失败，已恢复原状态: ${switchError}`)
+          void dialog.showMessageBox({
+            type: 'warning',
+            message:
+              typeof recoverOnFailure === 'function'
+                ? recoveryMessage
+                : '新引擎启动失败，已恢复原版本',
+            detail: String(switchError).slice(0, 900),
+            buttons: ['好']
+          })
+          refreshMenu()
+          return { ok: false, rolledBack: true, error: switchError }
+        }
+        switchError = `${switchError}\n\n恢复原状态后仍无法启动：${restored.error}`
+      } else {
+        switchError = `${switchError}\n\n恢复原状态失败：${restoredPointer?.error ?? '恢复功能不可用'}`
+      }
+    }
   } finally {
     swapping = false
   }
-  baseUrl = undefined
-  startBackend(0)
+
+  dialog.showErrorBox('启动 dsh 失败', String(switchError || '未知错误').slice(0, 1200))
+  app.quit()
+  return { ok: false, error: switchError }
 }
 
 // ── 升级流程（菜单驱动）──────────────────────────────────────────────────
@@ -749,25 +917,13 @@ async function upgradeTo(version) {
           `释放约 ${Math.round(result.pruned.freedBytes / 1048576)} MB`
       )
     }
-    pushSplash({
-      phase: '正在重启引擎',
-      detail: '窗口马上回来',
-      percent: null,
-      steps: gateSteps(gateState)
-    })
-
-    // 到这里才动旧后端。swapping 让 child 的 exit 处理器知道这是预期退出。
-    swapping = true
-    try {
-      await stopBackend()
-    } finally {
-      swapping = false
-    }
-    baseUrl = undefined
     setEngineBusy(false)
-    log(`引擎已切换到 ${version}，正在拉起新后端`)
-    // 新后端就绪后，startBackend 里的 onChunk 会调 loadIntoWindow 把 dsh 页面接回来。
-    startBackend(0)
+    log(`引擎指针已切换到 ${version}，正在拉起新后端`)
+    const restarted = await restartBackend({
+      phase: `正在启动 ${version}`,
+      rollbackOnFailure: true
+    })
+    if (restarted.ok) log(`引擎已切换到 ${version}`)
   } finally {
     if (engineStatus.busy) setEngineBusy(false)
   }
@@ -809,7 +965,7 @@ async function rollbackEngine() {
   }
   engineStatus = { ...engineStatus, hasUpdate: false }
   refreshMenu()
-  await restartBackend({ phase: `正在回滚到 ${result.version}` })
+  await restartBackend({ phase: `正在回滚到 ${result.version}`, rollbackOnFailure: true })
 }
 
 // ── 轮次通知 ────────────────────────────────────────────────────────────
@@ -1137,6 +1293,156 @@ function gateSteps(status = {}) {
   }))
 }
 
+// ── 首次启动向导：可选插件 ──
+
+const SETUP_FILE = path.join(__dirname, 'setup.html')
+
+function installationReceipt() {
+  try {
+    const executable = app.getPath('exe')
+    const stat = fs.statSync(executable)
+    // 覆盖安装 App 会换掉可执行文件的 inode / 出生时间；普通重启不会。
+    return `${app.getVersion()}:${executable}:${stat.ino}:${stat.birthtimeMs}`
+  } catch {
+    return `${app.getVersion()}:${app.getPath('exe')}`
+  }
+}
+
+function shouldShowSetup() {
+  if (process.env.DSH_MIN_SKIP_SETUP === '1' || process.env.DSH_MIN_ATTACH) return false
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsFilePath(), 'utf8'))
+    return settings?.setupReceipt !== installationReceipt()
+  } catch {
+    return true
+  }
+}
+
+function markSetupComplete() {
+  try {
+    fs.mkdirSync(DESKTOP_HOME, { recursive: true })
+    let existing = {}
+    try {
+      existing = JSON.parse(fs.readFileSync(settingsFilePath(), 'utf8')) ?? {}
+    } catch {}
+    const temp = `${settingsFilePath()}.tmp`
+    fs.writeFileSync(
+      temp,
+      `${JSON.stringify({ ...existing, setupReceipt: installationReceipt() }, null, 2)}\n`,
+      'utf8'
+    )
+    fs.renameSync(temp, settingsFilePath())
+  } catch (error) {
+    log('保存初始化标记失败:', String(error?.message || error))
+  }
+}
+
+function isSetupPage() {
+  if (!win || win.isDestroyed()) return false
+  try {
+    const current = new URL(win.webContents.getURL())
+    return current.protocol === 'file:' && decodeURIComponent(current.pathname) === SETUP_FILE
+  } catch {
+    return false
+  }
+}
+
+function setupCatalogForPage() {
+  return PLUGIN_CATALOG.map(({ id, name, subtitle, description }) => ({
+    id,
+    name,
+    subtitle,
+    description
+  }))
+}
+
+function pushSetupState(state) {
+  if (!win || win.isDestroyed() || !isSetupPage()) return
+  try {
+    const payload = JSON.stringify(state).replace(/</g, '\\u003c')
+    win.webContents
+      .executeJavaScript(`window.__dshSetup && window.__dshSetup.update(${payload})`, true)
+      .catch((error) => log('初始化页更新失败:', String(error?.message || error)))
+  } catch (error) {
+    log('初始化页更新异常:', String(error?.message || error))
+  }
+}
+
+async function showSetup() {
+  if (!win || win.isDestroyed()) return
+  try {
+    await win.loadFile(SETUP_FILE)
+    pushSetupState({ plugins: setupCatalogForPage(), busy: false, message: '' })
+  } catch (error) {
+    log('初始化页加载失败:', String(error?.message || error))
+  }
+}
+
+async function undoSetupTransactions(transactions) {
+  const errors = []
+  for (const transaction of [...transactions].reverse()) {
+    const result = await pluginInstaller().undo(transaction)
+    if (!result.ok) errors.push(result.error)
+  }
+  return errors.length === 0 ? { ok: true } : { ok: false, error: errors.join('\n') }
+}
+
+async function handleSetupIntent(url) {
+  if (!isSetupPage() || setupBusy) return
+  let intent
+  try {
+    intent = new URL(url)
+  } catch {
+    return
+  }
+  if (intent.hostname !== 'continue') return
+
+  const requested = (intent.searchParams.get('plugins') || '').split(',').filter(Boolean)
+  const selected = [...new Set(requested)]
+  if (selected.some((id) => !PLUGIN_CATALOG.some((plugin) => plugin.id === id))) return
+
+  setupBusy = true
+  const transactions = []
+  try {
+    for (let index = 0; index < selected.length; index += 1) {
+      const plugin = PLUGIN_CATALOG.find((entry) => entry.id === selected[index])
+      pushSetupState({
+        busy: true,
+        message: `正在安装 ${plugin.name}（${index + 1}/${selected.length}）…`
+      })
+      const result = await pluginInstaller().change(plugin.id, 'install')
+      if (!result.ok) {
+        const recovered = await undoSetupTransactions(transactions)
+        pushSetupState({
+          busy: false,
+          error:
+            `安装 ${plugin.name} 失败：${String(result.error).slice(0, 650)}` +
+            (!result.recovered && result.recoveryError
+              ? `\n\n恢复失败：${String(result.recoveryError).slice(0, 350)}`
+              : '') +
+            (!recovered.ok ? `\n\n恢复先前选项失败：${String(recovered.error).slice(0, 350)}` : '')
+        })
+        return
+      }
+      if (result.changed) transactions.push(result.transaction)
+    }
+
+    const started = await restartBackend({
+      phase: selected.length > 0 ? '插件已安装，正在启动 DSH' : '正在启动 DSH',
+      recoverOnFailure:
+        transactions.length > 0 ? () => undoSetupTransactions(transactions) : undefined,
+      recoveryPhase: '插件导致启动失败，正在恢复初始状态',
+      recoveryMessage: '选装插件导致 DSH 启动失败，已恢复为未安装状态'
+    })
+    if (started.ok || started.rolledBack) {
+      markSetupComplete()
+      scheduleAfterStartup()
+    }
+  } finally {
+    setupBusy = false
+  }
+}
+
 // ── 窗口 ────────────────────────────────────────────────────────────────
 
 /**
@@ -1248,6 +1554,7 @@ function createWindow() {
 
   // 外链交给系统浏览器，窗口内不开新窗口。
   win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('dsh-setup://')) return { action: 'deny' }
     if (url.startsWith('http://127.0.0.1:')) return { action: 'allow' }
     void shell.openExternal(url)
     return { action: 'deny' }
@@ -1255,6 +1562,13 @@ function createWindow() {
 
   // 只允许留在本机 loopback 上，防止被导航到外部站点。
   win.webContents.on('will-navigate', (event, url) => {
+    // 初始化页不拥有 preload/IPC，只能通过这个自定义 URL 表达意图。
+    // 必须同时校验「当前页就是 App 自带插件页」，远端 DSH 页无法借此调用。
+    if (url.startsWith('dsh-setup://')) {
+      event.preventDefault()
+      if (isSetupPage()) void handleSetupIntent(url)
+      return
+    }
     if (!url.startsWith('http://127.0.0.1:')) {
       event.preventDefault()
       void shell.openExternal(url)
@@ -1386,7 +1700,10 @@ function buildMenu() {
           if (confirm.response !== 1) return
           engine.useBundled()
           refreshMenu()
-          await restartBackend()
+          await restartBackend({
+            phase: `正在启动 App 自带引擎`,
+            rollbackOnFailure: true
+          })
         }
       })
     }
@@ -1533,6 +1850,23 @@ function buildMenu() {
 
 // ── 生命周期 ────────────────────────────────────────────────────────────
 
+function scheduleAfterStartup() {
+  if (!process.env.DSH_MIN_NO_UPDATE_CHECK) {
+    const timer = setTimeout(() => {
+      void checkForUpdates({ silent: true })
+    }, 8000)
+    timer.unref?.()
+  }
+
+  if (process.env.DSH_MIN_TEST_UPGRADE) {
+    const target = process.env.DSH_MIN_TEST_UPGRADE
+    const delay = Number(process.env.DSH_MIN_TEST_UPGRADE_DELAY ?? 6000)
+    log(`[测试] ${delay}ms 后触发升级流程 → ${target}`)
+    const timer = setTimeout(() => void upgradeTo(target), delay)
+    timer.unref?.()
+  }
+}
+
 app.on('window-all-closed', () => {
   // macOS 习惯：关窗不退出应用，后端继续跑，任务不中断。
   if (process.platform !== 'darwin') app.quit()
@@ -1545,6 +1879,8 @@ app.on('activate', () => {
   }
   createWindow()
   if (baseUrl) loadIntoWindow(baseUrl)
+  else if (shouldShowSetup()) void showSetup()
+  else void restartBackend({ phase: '正在启动 DSH' })
 })
 
 app.on('before-quit', (event) => {
@@ -1575,10 +1911,16 @@ if (!app.requestSingleInstanceLock()) {
     loadSettings()
 
 
+    const startupUpdater = updater()
+    const reconciled = startupUpdater?.reconcilePointers()
+    if (reconciled?.corrected?.length) {
+      log(`启动校正：清理失效的引擎指针（${reconciled.corrected.join('、')}）`)
+    }
+
     // 收掉历史累积：以前每次升级都只写指针、不删旧目录，所以装了多个版本的
     // 用户这里会被一次性清理到「当前 + 上一个」。只能保留两个是设计，不是妥协 ——
     // 能回滚的只有一步，第三代留着纯占磁盘（一个约 280MB）。
-    const startupPrune = updater()?.pruneEngines()
+    const startupPrune = startupUpdater?.pruneEngines()
     if (startupPrune?.removed?.length) {
       log(
         `启动清理：删掉 ${startupPrune.removed.length} 个旧引擎（${startupPrune.removed.join('、')}），` +
@@ -1600,6 +1942,9 @@ if (!app.requestSingleInstanceLock()) {
       // 接入一个已经在跑的实例（跳过自己拉起后端）。
       // 那个实例的 token 只存在于它自己的启动输出里，所以必须由你显式提供。
       attachToExisting(process.env.DSH_MIN_ATTACH)
+    } else if (shouldShowSetup()) {
+      await showSetup()
+      return
     } else {
       const engine = resolveEngine()
       await showSplash({
@@ -1612,28 +1957,13 @@ if (!app.requestSingleInstanceLock()) {
 
       // port 0 = 让系统分配空闲端口，避免和你在终端里跑的 dsh 抢端口。
       // 孤儿后端由 watchdog.js 负责（壳一死就收尸），这里不用管。
-      startBackend(0)
+      const started = await startBackend(0)
+      if (!started.ok) {
+        dialog.showErrorBox('启动 dsh 失败', String(started.error || '未知错误').slice(0, 1200))
+        app.quit()
+        return
+      }
     }
-
-    // 启动后静默检查一次更新。有新版才在「引擎」菜单里出现「升级到 X」，
-    // 不弹窗、不打断 —— 检测到就够，决定权留给你。
-    // 延迟一点，避免和后端启动抢资源。
-    if (!process.env.DSH_MIN_NO_UPDATE_CHECK) {
-      const timer = setTimeout(() => {
-        void checkForUpdates({ silent: true })
-      }, 8000)
-      timer.unref?.()
-    }
-
-    // 测试钩子：启动后直接跑一次升级流程，用来验证接管页和失败回滚。
-    // 菜单里只能点到「最新版」，这个口子可以指定任意版本（包括不存在的版本，
-    // 用来走失败路径）。同样用 DSH_MIN_ 前缀，和别的调试开关一致。
-    if (process.env.DSH_MIN_TEST_UPGRADE) {
-      const target = process.env.DSH_MIN_TEST_UPGRADE
-      const delay = Number(process.env.DSH_MIN_TEST_UPGRADE_DELAY ?? 6000)
-      log(`[测试] ${delay}ms 后触发升级流程 → ${target}`)
-      const timer = setTimeout(() => void upgradeTo(target), delay)
-      timer.unref?.()
-    }
+    scheduleAfterStartup()
   })
 }

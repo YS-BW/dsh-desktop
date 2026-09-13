@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>初始设置</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5; --panel: #fff; --fg: #181715; --muted: #77736e;
+    --line: #e7e4df; --soft: #f0efec; --primary: #20201e; --primary-fg: #fff;
+    --accent: #397be8; --danger: #b6342a; --shadow: 0 10px 32px rgba(30, 25, 20, .06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151412; --panel: #1d1b19; --fg: #f1efec; --muted: #a19b95;
+      --line: #34302c; --soft: #292622; --primary: #f1efec; --primary-fg: #191715;
+      --accent: #76a7ff; --danger: #ff7569; --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg); }
+  body {
+    font: 13px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  .titlebar { position: fixed; z-index: 10; inset: 0 0 auto 0; height: 38px; -webkit-app-region: drag; }
+  main { width: min(840px, calc(100% - 64px)); margin: 0 auto; padding: 70px 0 54px; }
+  .step { color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+  h1 { margin: 5px 0 9px; font-size: 28px; line-height: 1.2; letter-spacing: -.025em; }
+  .lead { color: var(--muted); margin: 0; max-width: 650px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 28px; }
+  .card {
+    position: relative; min-height: 218px; border: 1px solid var(--line); border-radius: 15px;
+    background: var(--panel); box-shadow: var(--shadow); padding: 22px; cursor: pointer;
+    display: flex; flex-direction: column; transition: border-color .15s, transform .15s;
+    -webkit-app-region: no-drag;
+  }
+  .card:hover { transform: translateY(-1px); }
+  .card.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), var(--shadow); }
+  .check {
+    position: absolute; right: 18px; top: 18px; width: 20px; height: 20px;
+    border: 1.5px solid var(--line); border-radius: 6px; display: grid; place-items: center;
+    color: white; font-size: 12px; font-weight: 700;
+  }
+  .selected .check { background: var(--accent); border-color: var(--accent); }
+  .icon {
+    width: 43px; height: 43px; border-radius: 11px; display: grid; place-items: center;
+    background: var(--soft); font-size: 19px; font-weight: 700; letter-spacing: -.06em;
+  }
+  h2 { margin: 16px 0 2px; font-size: 16px; line-height: 1.25; }
+  .package { color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .description { margin: 12px 0 0; color: var(--muted); }
+  .hint { margin: 18px 0 0; color: var(--muted); font-size: 12px; }
+  .actions { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 24px; }
+  button {
+    border: 0; border-radius: 9px; padding: 10px 17px; min-width: 98px;
+    background: var(--primary); color: var(--primary-fg); font: inherit; font-weight: 600;
+    cursor: pointer; -webkit-app-region: no-drag;
+  }
+  button.secondary { background: var(--soft); color: var(--fg); }
+  button:disabled, .busy .card { cursor: default; opacity: .5; transform: none; }
+  .status { min-height: 22px; margin-top: 14px; color: var(--muted); font-size: 12px; text-align: right; }
+  .status.error { color: var(--danger); white-space: pre-wrap; }
+  @media (max-width: 700px) {
+    main { width: min(520px, calc(100% - 36px)); padding-top: 60px; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="titlebar"></div>
+  <main id="root">
+    <div class="step">初始设置 · 可选</div>
+    <h1>选装 DSH 插件</h1>
+    <p class="lead">你可以在首次启动时一起安装这些插件。默认不选择任何插件，直接继续就是原生 DSH。
+    </p>
+    <section class="grid" id="plugins"></section>
+    <p class="hint">选中项仅在本次初始化时安装。之后的插件更新、卸载和其他管理仍由 DSH 自己负责。</p>
+    <div class="actions">
+      <button class="secondary" id="skip">跳过</button>
+      <button id="continue">安装已选并继续</button>
+    </div>
+    <div class="status" id="status"></div>
+  </main>
+
+<script>
+  const root = document.getElementById('root')
+  const list = document.getElementById('plugins')
+  const status = document.getElementById('status')
+  const selected = new Set()
+  let plugins = []
+  let busy = false
+
+  function render() {
+    list.textContent = ''
+    for (const plugin of plugins) {
+      const card = document.createElement('article')
+      card.className = `card${selected.has(plugin.id) ? ' selected' : ''}`
+      card.tabIndex = busy ? -1 : 0
+
+      const check = document.createElement('span')
+      check.className = 'check'
+      check.textContent = selected.has(plugin.id) ? '\u2713' : ''
+      const icon = document.createElement('div')
+      icon.className = 'icon'
+      icon.textContent = plugin.id === 'dsh-market' ? 'M' : 'S'
+      const name = document.createElement('h2')
+      name.textContent = plugin.name
+      const packageName = document.createElement('div')
+      packageName.className = 'package'
+      packageName.textContent = plugin.subtitle
+      const description = document.createElement('p')
+      description.className = 'description'
+      description.textContent = plugin.description
+
+      const toggle = () => {
+        if (busy) return
+        if (selected.has(plugin.id)) selected.delete(plugin.id)
+        else selected.add(plugin.id)
+        render()
+      }
+      card.addEventListener('click', toggle)
+      card.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          toggle()
+        }
+      })
+      card.append(check, icon, name, packageName, description)
+      list.appendChild(card)
+    }
+    document.getElementById('continue').textContent =
+      selected.size > 0 ? `安装已选（${selected.size}）并继续` : '继续'
+  }
+
+  function finish(ids) {
+    if (busy) return
+    const value = ids.map(encodeURIComponent).join(',')
+    window.location.href = `dsh-setup://continue?plugins=${value}`
+  }
+
+  document.getElementById('skip').addEventListener('click', () => finish([]))
+  document.getElementById('continue').addEventListener('click', () => finish([...selected]))
+
+  window.__dshSetup = {
+    update(state) {
+      if (!state) return
+      if (Array.isArray(state.plugins)) plugins = state.plugins
+      busy = Boolean(state.busy)
+      root.classList.toggle('busy', busy)
+      document.getElementById('skip').disabled = busy
+      document.getElementById('continue').disabled = busy
+      status.classList.toggle('error', Boolean(state.error))
+      status.textContent = state.error || state.message || ''
+      render()
+    }
+  }
+</script>
+</body>
+</html>

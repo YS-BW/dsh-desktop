@@ -146,8 +146,53 @@ function createUpdater(options) {
     return currentVersion() ?? fallbackVersion ?? bundledVersion()
   }
 
-  /** 已安装的引擎列表（含大小），按版本倒序。 */
-  function listEngines() {
+  /** 某个版本是否确实还能作为切换目标。 */
+  function isUsableVersion(version) {
+    if (version === undefined) return false
+    if (version === bundledVersion()) return true
+    return fs.existsSync(engineBinPath(engineDir(version)))
+  }
+
+  /**
+   * 清理 App 覆盖更新后留下的失效指针。
+   *
+   * 典型场景：旧 App 自带 0.1.2，用户升级到外置 0.1.5，于是 previous=0.1.2；
+   * 后来覆盖安装的新 App 已经自带 0.1.5，但磁盘上并没有外置 0.1.2。旧 previous
+   * 此时已经无法回退，继续展示它只会让菜单承诺一个不存在的目标。
+   */
+  function reconcilePointers() {
+    const corrected = []
+    const rawCurrent = readPointer(currentFile)
+    if (fs.existsSync(currentFile) && currentVersion() === undefined) {
+      clearPointer(currentFile)
+      corrected.push(rawCurrent ? `current=${rawCurrent}` : 'current（格式无效）')
+    }
+
+    const active = currentVersion() ?? bundledVersion()
+    const previous = readPrevious()
+    if (
+      fs.existsSync(previousFile) &&
+      (previous === undefined || previous === active || !isUsableVersion(previous))
+    ) {
+      clearPointer(previousFile)
+      corrected.push(previous ? `previous=${previous}` : 'previous（格式无效）')
+    }
+
+    return { active, previous: validPrevious(), corrected }
+  }
+
+  /** 只返回存在、可启动、且与当前版本不同的回退目标。 */
+  function validPrevious() {
+    const previous = readPrevious()
+    const active = currentVersion() ?? bundledVersion()
+    if (previous === undefined || previous === active || !isUsableVersion(previous)) {
+      return undefined
+    }
+    return previous
+  }
+
+  /** 已安装的引擎列表，按版本倒序；目录大小只在清理时按需统计。 */
+  function listEngines({ includeSize = false } = {}) {
     let names = []
     try {
       names = fs.readdirSync(enginesDir)
@@ -162,12 +207,13 @@ function createUpdater(options) {
       const dir = engineDir(name)
       const bin = engineBinPath(dir)
       if (!fs.existsSync(bin)) continue
-      engines.push({
+      const engine = {
         version: name,
         path: dir,
-        active: name === active,
-        sizeBytes: directorySize(dir)
-      })
+        active: name === active
+      }
+      if (includeSize) engine.sizeBytes = directorySize(dir)
+      engines.push(engine)
     }
     return engines.sort((a, b) => compareVersions(b.version, a.version))
   }
@@ -476,7 +522,7 @@ function createUpdater(options) {
     if (fs.existsSync(engineBinPath(target))) {
       // 已经装过这个版本，直接切过去
       onProgress({ phase: 'reuse', message: `已装过 ${version}，直接切换` })
-      return promote(version)
+      return { ok: true, version, reused: true, ...promote(version) }
     }
 
     fs.mkdirSync(enginesDir, { recursive: true })
@@ -572,6 +618,8 @@ function createUpdater(options) {
    * 注意这里只改指针，不动任何引擎文件。
    */
   function promote(version) {
+    // 覆盖安装 App 后，旧 previous 可能已不再存在；先清理再记录这次真实切换。
+    reconcilePointers()
     // 记下「切换前在用的版本」——可能是已装引擎，也可能是自带引擎的版本号
     const before = currentVersion() ?? bundledVersion()
     if (before !== undefined && before !== version) writePrevious(before)
@@ -590,9 +638,9 @@ function createUpdater(options) {
    *   · 它是 App 自带的那份（版本号等于自带引擎）→ 清掉 current 指针
    */
   function rollback() {
-    const previous = readPrevious()
+    const previous = reconcilePointers().previous
     if (previous === undefined) {
-      return { ok: false, error: '还没有记录到上一个版本' }
+      return { ok: false, error: '没有可用的上一个版本' }
     }
 
     const active = currentVersion() ?? bundledVersion()
@@ -619,13 +667,14 @@ function createUpdater(options) {
   function useBundled() {
     const active = currentVersion() ?? bundledVersion()
     clearPointer(currentFile)
-    if (active !== undefined) writePrevious(active)
+    if (active !== undefined && active !== bundledVersion()) writePrevious(active)
+    else clearPointer(previousFile)
     return { ok: true, previous: active }
   }
 
-  /** 上一个状态（供界面显示「可回滚到 …」）。 */
+  /** 上一个可用状态（供界面显示「可回滚到 …」）。 */
   function previousState() {
-    return readPrevious()
+    return validPrevious()
   }
 
   /** 删掉某个引擎版本。不允许删当前正在用的那个。 */
@@ -656,10 +705,10 @@ function createUpdater(options) {
    * 只在指针**已经写完**之后调用，否则可能把马上要用的那个目录删掉。
    */
   function pruneEngines() {
-    const keep = new Set([currentVersion(), readPrevious()].filter((v) => v !== undefined))
+    const keep = new Set([currentVersion(), validPrevious()].filter((v) => v !== undefined))
     const removed = []
     let freedBytes = 0
-    for (const engine of listEngines()) {
+    for (const engine of listEngines({ includeSize: true })) {
       if (keep.has(engine.version)) continue
       try {
         fs.rmSync(engine.path, { recursive: true, force: true })
@@ -694,6 +743,7 @@ function createUpdater(options) {
     engineBinPath,
     currentVersion,
     runningVersion,
+    reconcilePointers,
     listEngines,
     pruneEngines,
     readState,
