@@ -147,12 +147,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          set -euo pipefail
           TAG="${{ steps.tag.outputs.name }}"
-          files=$(find dist -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) | sort)
-          echo "标签 $TAG，共 $(echo "$files" | wc -l) 个文件"
+          # 必须用数组：产物名形如 `DSH Desktop Min-0.5.1-arm64.dmg`，**带空格**，
+          # 未加引号的 $files 会被词分割成 dist/macos/DSH + Desktop + … 
+          mapfile -t files < <(find dist -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) | sort)
+          printf '标签 %s，共 %d 个文件：\n' "$TAG" "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
           # 已经建好的 release 就直接补传；没有就新建
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" $files --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" $files --title "$TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
+            gh release create "$TAG" "${files[@]}" --title "$TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
           fi
