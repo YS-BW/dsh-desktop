@@ -39,8 +39,14 @@ const zlib = require('node:zlib')
 /** zstd 帧魔数 0xFD2FB528 的小端字节序。 */
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
-/** 会话日志的文件名。 */
-const LOG_FILENAME = 'session.jsonl.zstd'
+/**
+ * 会话日志文件名，按新版优先。
+ *
+ * DSH 0.1.5 把活动日志切换为 session.v3.jsonl.zstd；旧版本仍写
+ * session.jsonl.zstd。一个会话目录可能同时保留两份，因此每个会话只监听优先
+ * 的那一份，不能两份都 tail，否则升级过渡期会把同一轮通知两次。
+ */
+const LOG_FILENAMES = ['session.v3.jsonl.zstd', 'session.jsonl.zstd']
 
 /** 文件事件的防抖：fs.watch 一次追加会连发好几个事件。 */
 const DEBOUNCE_MS = 150
@@ -123,10 +129,18 @@ function findLastFrameStart(filePath, size) {
 /**
  * @param options.sessionsDir  DSH_HOME/sessions
  * @param options.onTurnEnd    轮次结束时回调 { sessionId, turn, reason, durationMs }
+ * @param options.onUserQuestion 用户需要选择时回调
+ * @param options.onApprovalAsked 用户需要授权时回调
  * @param options.log
  */
 function createTurnWatcher(options) {
-  const { sessionsDir, onTurnEnd, log = () => {} } = options
+  const {
+    sessionsDir,
+    onTurnEnd = () => {},
+    onUserQuestion = () => {},
+    onApprovalAsked = () => {},
+    log = () => {}
+  } = options
 
   /** filePath -> { offset }：已消费到的字节偏移。 */
   const files = new Map()
@@ -137,8 +151,20 @@ function createTurnWatcher(options) {
    *
    * 用来做通知正文：用户要的是「谁 + 说了什么」，而不是「任务完成」这种空洞文案。
    * 只在 assistant/message 里取 type==='text' 的块 —— reasoning 是思考过程，不该外泄到通知。
-   */
+  */
   const lastAssistantText = new Map()
+  /** 切换旧/新日志来源时，同一轮结束不能重复提醒。 */
+  const announcedTurnEnds = new Set()
+  /** 等待用户选择的 tool call。结果回来后清掉，避免重放时重复提醒。 */
+  const pendingUserQuestions = new Set()
+  /** 本次 App 生命周期内已经通知过的选择请求，切换日志格式时也不能重复提醒。 */
+  const announcedUserQuestions = new Set()
+  /** 等待授权的请求。用户决定后清掉，避免重放时重复提醒。 */
+  const pendingApprovals = new Set()
+  /** 本次 App 生命周期内已经通知过的授权请求，切换日志格式时也不能重复提醒。 */
+  const announcedApprovals = new Set()
+  /** session directory -> 当前实际监听的日志文件。 */
+  const sessionLogs = new Map()
 
   /** watcher 启动时刻。用来挡掉「文件被延迟发现、从头读」时回放出来的历史轮次。 */
   const startedAt = Date.now()
@@ -271,6 +297,35 @@ function createTurnWatcher(options) {
     return joined === '' ? undefined : joined
   }
 
+  /**
+   * DSH 的 ask_user_question 是一个会阻塞 Agent 的正式工具调用，不需要猜 UI 状态。
+   * 只提取可安全显示在通知里的第一道问题；完整问题仍由 DSH 原生界面负责呈现。
+   */
+  function userQuestionOf(event) {
+    if (event?.data?.name !== 'ask_user_question') return undefined
+    const callId = event.data.callId
+    if (typeof callId !== 'string' || callId === '') return undefined
+    let questions
+    try {
+      questions = JSON.parse(event.data.arguments).questions
+    } catch {
+      return { callId }
+    }
+    if (!Array.isArray(questions) || questions.length === 0) return { callId }
+    const first = questions[0]
+    return {
+      callId,
+      header: typeof first?.header === 'string' ? first.header : undefined,
+      question: typeof first?.question === 'string' ? first.question : undefined
+    }
+  }
+
+  /** 只派发 watcher 启动之后发生的事件，避免启动时把历史等待状态重新弹出。 */
+  function happenedAfterStart(event) {
+    const time = Number(event?.time)
+    return !Number.isFinite(time) || time >= startedAt
+  }
+
   function handleEvent(sessionId, event) {
     const type = event?.type
     if (type === 'assistant/message') {
@@ -283,6 +338,55 @@ function createTurnWatcher(options) {
       lastAssistantText.delete(sessionId) // 新一轮，清掉上一轮的摘要
       return
     }
+
+    if (type === 'tool/call') {
+      const request = userQuestionOf(event)
+      if (!request || !happenedAfterStart(event)) return
+      const key = `${sessionId}:${request.callId}`
+      if (announcedUserQuestions.has(key)) return
+      pendingUserQuestions.add(key)
+      announcedUserQuestions.add(key)
+      try {
+        onUserQuestion({ sessionId, ...request })
+      } catch (error) {
+        log('人工选择通知回调出错:', String(error?.message || error))
+      }
+      return
+    }
+
+    if (type === 'tool/result') {
+      const callId = event?.data?.callId
+      if (typeof callId === 'string') pendingUserQuestions.delete(`${sessionId}:${callId}`)
+      return
+    }
+
+    if (type === 'approval/asked') {
+      if (!happenedAfterStart(event)) return
+      const id = event?.data?.id
+      if (typeof id !== 'string' || id === '') return
+      const key = `${sessionId}:${id}`
+      if (announcedApprovals.has(key)) return
+      pendingApprovals.add(key)
+      announcedApprovals.add(key)
+      try {
+        onApprovalAsked({
+          sessionId,
+          id,
+          toolName: typeof event.data.toolName === 'string' ? event.data.toolName : undefined,
+          reason: typeof event.data.reason === 'string' ? event.data.reason : undefined
+        })
+      } catch (error) {
+        log('授权等待通知回调出错:', String(error?.message || error))
+      }
+      return
+    }
+
+    if (type === 'approval/decided') {
+      const id = event?.data?.id
+      if (typeof id === 'string') pendingApprovals.delete(`${sessionId}:${id}`)
+      return
+    }
+
     if (type !== 'turn/end') return
 
     const endedAt = Number(event.time) || Date.now()
@@ -290,7 +394,12 @@ function createTurnWatcher(options) {
     // 只处理 watcher 启动之后发生的轮次。
     // 有它兜底，即使某个会话日志被延迟发现、从字节 0 开始读，也不会把历史轮次
     // 当成新完成的任务弹一堆通知。
-    if (endedAt < startedAt) return
+    if (!happenedAfterStart(event)) return
+
+    const turn = event.data?.turn
+    const turnKey = `${sessionId}:${turn === undefined ? event.seq ?? event.time : turn}`
+    if (announcedTurnEnds.has(turnKey)) return
+    announcedTurnEnds.add(turnKey)
 
     const turnStartedAt = openTurns.get(sessionId)
     openTurns.delete(sessionId)
@@ -300,7 +409,7 @@ function createTurnWatcher(options) {
     try {
       onTurnEnd({
         sessionId,
-        turn: event.data?.turn,
+        turn,
         reason: event.data?.reason?.kind ?? 'unknown',
         summary,
         durationMs:
@@ -354,7 +463,22 @@ function createTurnWatcher(options) {
       }
       for (const session of sessions) {
         if (!session.isDirectory()) continue
-        const filePath = path.join(bucketDir, session.name, LOG_FILENAME)
+        const sessionDir = path.join(bucketDir, session.name)
+        let filePath
+        for (const filename of LOG_FILENAMES) {
+          const candidate = path.join(sessionDir, filename)
+          try {
+            if ((await fs.promises.stat(candidate)).isFile()) {
+              filePath = candidate
+              break
+            }
+          } catch {}
+        }
+        if (!filePath) continue
+
+        // 新版日志一旦出现，切到它；旧版日志仍保留在目录里，但不再重复消费。
+        const previous = sessionLogs.get(sessionDir)
+        if (previous !== filePath) sessionLogs.set(sessionDir, filePath)
 
         if (!files.has(filePath)) {
           // 启动时就存在的文件：只记当前位置，不回溯历史（否则一开机就狂弹旧通知）。
@@ -382,9 +506,9 @@ function createTurnWatcher(options) {
           return
         }
         const name = String(filename)
-        if (!name.endsWith(LOG_FILENAME)) return
+        if (!LOG_FILENAMES.some((filename) => name.endsWith(filename))) return
         const filePath = path.resolve(sessionsDir, name)
-        if (!files.has(filePath)) {
+        if (!files.has(filePath) || sessionLogs.get(path.dirname(filePath)) !== filePath) {
           void sweep()
           return
         }
@@ -409,7 +533,7 @@ function createTurnWatcher(options) {
     pending.clear()
   }
 
-  return { start, stop, _internal: { decodeFrames, baseline } }
+  return { start, stop, _internal: { decodeFrames, baseline, sweep, handleEvent } }
 }
 
 /**
@@ -450,7 +574,7 @@ module.exports = {
   createTurnWatcher,
   formatDuration,
   summarize,
-  LOG_FILENAME,
+  LOG_FILENAMES,
   ZSTD_MAGIC,
   _internal: { zstdFrameEnd, findLastFrameStart }
 }

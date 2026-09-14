@@ -449,7 +449,9 @@ const NOTIFY_DEFAULTS = {
   longThresholdMs: 30_000,
   showTitle: true,
   showSummary: true,
-  notifyOnInterrupt: true
+  notifyOnInterrupt: true,
+  notifyOnUserQuestion: true,
+  notifyOnApproval: true
 }
 
 let notifySettings = { ...NOTIFY_DEFAULTS }
@@ -1263,6 +1265,37 @@ async function testNotificationPermission() {
   })
 }
 
+/** 投递业务通知并记录结果，让完成、选择、授权三类事件共享同一条诊断链。 */
+function deliverNotification({ title, body }) {
+  const label = `${title}：${body || '(无正文)'}`
+  void notify({ title, body, onClick: focusWindow }).then((outcome) => {
+    lastDelivery = { at: Date.now(), outcome, label }
+    refreshMenu()
+    log(
+      outcome === 'shown'
+        ? `通知已投递：${label}`
+        : `通知投递失败(${outcome})：${label}`
+    )
+  })
+}
+
+/** 不同的非正常结束原因需要说清事实，不能一律模糊成「中断」。 */
+function turnEndBody(reason) {
+  switch (reason) {
+    case 'aborted':
+    case 'interrupted':
+      return '任务已中断'
+    case 'error':
+      return '任务执行失败'
+    case 'blocked':
+      return '任务无法继续'
+    case 'max-tokens':
+      return '任务达到输出上限'
+    default:
+      return '任务已结束'
+  }
+}
+
 function startNotifier() {
   if (turnWatcher) return
   turnWatcher = createTurnWatcher({
@@ -1301,14 +1334,14 @@ function startNotifier() {
       //
       // 刻意**不显示「任务完成」和用时**：正常跑完是默认预期，写在通知里是噪音；
       // 一条只有「谁 + 说了什么」的通知信息密度最高。
-      // 中断则相反 —— 它是异常路径，必须说出来，所以正文直接写「任务中断」，
+      // 中断则相反 —— 它是异常路径，必须说清实际原因，
       // 并且**不显示那半截摘要**，免得让人误以为这轮正常跑完了。
       const title = notifySettings.showTitle ? sessionTitle(sessionId) : undefined
       const summary = notifySettings.showSummary ? summarize(summaryText) : undefined
 
       let body
       if (!completed) {
-        body = '任务中断'
+        body = turnEndBody(reason)
       } else if (summary !== undefined) {
         body = summary
       } else if (notifySettings.showSummary) {
@@ -1319,21 +1352,29 @@ function startNotifier() {
       }
 
       const titleText = title ?? 'DSH Desktop Min'
-      const label = `${titleText}：${body || '(无正文)'}`
-
-      notify({
-        title: titleText,
-        body,
-        // 点通知就回到窗口 —— 这是桌面端相对浏览器通知的独有优势
-        onClick: focusWindow
-      }).then((outcome) => {
-        lastDelivery = { at: Date.now(), outcome, label }
-        refreshMenu() // 菜单里要显示「最近投递」
-        log(
-          outcome === 'shown'
-            ? `通知已投递：${label}`
-            : `通知投递失败(${outcome})：${label}`
-        )
+      deliverNotification({ title: titleText, body })
+    },
+    onUserQuestion: ({ sessionId, header, question }) => {
+      if (!notifySettings.enabled || !notifySettings.notifyOnUserQuestion) {
+        log('需要人工选择，但对应通知已关闭，跳过')
+        return
+      }
+      const title = notifySettings.showTitle ? sessionTitle(sessionId) : undefined
+      const detail = summarize(header || question, 80)
+      deliverNotification({
+        title: title ?? 'DSH Desktop Min',
+        body: detail === undefined ? '等待你的选择' : `等待你的选择：${detail}`
+      })
+    },
+    onApprovalAsked: ({ sessionId, toolName }) => {
+      if (!notifySettings.enabled || !notifySettings.notifyOnApproval) {
+        log('等待授权，但对应通知已关闭，跳过')
+        return
+      }
+      const title = notifySettings.showTitle ? sessionTitle(sessionId) : undefined
+      deliverNotification({
+        title: title ?? 'DSH Desktop Min',
+        body: toolName ? `等待授权：${toolName}` : '等待你的授权'
       })
     }
   })
@@ -2056,7 +2097,7 @@ function buildMenu() {
   // ── 通知菜单：独立的顶级分块，不挂在「服务」下面 ──────────────────────
   //
   // 一二级划分原则：**一级放「开关和动作」，二级放「成组的选项」**。
-  //   一级：启用通知 / 任务中断时也通知（两个独立开关）、测试通知权限（动作）、
+  //   一级：启用通知 / 各状态开关 / 测试通知权限（动作）、
   //         最近投递（状态）
   //   二级：通知方式（三选一）、通知内容（多选）—— 成组的偏好才有资格当二级
   const modeItems = [
@@ -2099,6 +2140,18 @@ function buildMenu() {
       type: 'checkbox',
       checked: notifySettings.notifyOnInterrupt,
       click: (item) => updateNotifySettings({ notifyOnInterrupt: item.checked })
+    },
+    {
+      label: '需要人工选择时通知',
+      type: 'checkbox',
+      checked: notifySettings.notifyOnUserQuestion,
+      click: (item) => updateNotifySettings({ notifyOnUserQuestion: item.checked })
+    },
+    {
+      label: '等待授权时通知',
+      type: 'checkbox',
+      checked: notifySettings.notifyOnApproval,
+      click: (item) => updateNotifySettings({ notifyOnApproval: item.checked })
     },
     { type: 'separator' },
     { label: '通知方式', submenu: modeItems },

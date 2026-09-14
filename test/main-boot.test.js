@@ -181,6 +181,15 @@ test('menu template matches the platform convention', () => {
   }
 })
 
+test('notification menu exposes the three actionable-status switches', () => {
+  const notificationMenu = booted.calls.menuTemplate.find((item) => item.label === '通知')
+  assert.ok(notificationMenu, '应该有通知菜单')
+  const labels = notificationMenu.submenu.map((item) => item.label).filter(Boolean)
+  for (const label of ['任务中断时也通知', '需要人工选择时通知', '等待授权时通知']) {
+    assert.ok(labels.includes(label), `通知菜单必须提供「${label}」开关`)
+  }
+})
+
 test('Windows registers an AppUserModelID for toast notifications', () => {
   const { calls } = booted
   if (isWindows) {
